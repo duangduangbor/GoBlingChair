@@ -1,0 +1,6 @@
+[
+null,
+{"id":1,"name":"ポーション","description":"HPを50回復する。","note":"","price":50},
+{"id":2,"name":"マナポーション","description":"MPを30回復する。","note":"","price":80},
+{"id":3,"name":"エリクサー","description":"HPとMPを全回復する伝説の薬。","note":"","price":9999}
+]

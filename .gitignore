@@ -1,0 +1,33 @@
+# ============================================================
+# 白名单模式：默认忽略所有文件，只放行源码与构建脚本
+# （开发目录里有大量日志/诊断/构建产物，逐个排除容易漏，故反向白名单）
+# ============================================================
+
+# —— 默认全部忽略 ——
+*
+
+# —— 放行：仓库核心文件 ——
+!.gitignore
+!README.md
+!LICENSE
+!build_exe.spec
+!build_portable.py
+!make_icon.py
+
+# —— 放行：图标资源（仅 GoBlingChair 系列与 AI 生成头像） ——
+!assets/
+!assets/GoBlingChair.ico
+!assets/GoBlingChair.png
+!assets/GoBlingChair_128.png
+!assets/Q版像素风格头像.jpg
+
+# —— 放行：主源码包 ——
+!gametl/
+!gametl/**
+
+# —— 在源码包内排除：缓存 / 运行产物 / 本机诊断脚本 ——
+**/__pycache__/
+*.pyc
+gametl/output/
+gametl/examples/diag_*
+gametl/examples/probe_*

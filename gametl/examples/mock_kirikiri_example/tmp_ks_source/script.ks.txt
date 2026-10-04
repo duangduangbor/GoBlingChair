@@ -1,0 +1,36 @@
+; 这是 KiriKiri 示例脚本
+[cm]
+[link target=*start]
+
+*start
+[cm]
+[bg storage="town.jpg" time=500]
+小さな村の朝。鳥のさえずりが聞こえる。[r]
+
+[name="エレン"]
+おはよう、[pcname]さん。よく眠れた？[r]
+
+[name="ミア"]
+お姉ちゃん、早くして！市場が始まっちゃうよ。[r]
+
+[name="エレン"]
+よし、それじゃあ市場に行こうか。何かいいものが見つかるといいね。[r]
+
+; 選択肢
+[link target=*market]市場へ行く[endlink][r]
+[link target=*stay]家に残る[endlink][r]
+
+*market
+[cm]
+[name="ミア"]
+あっ、あそこに武器屋さんがあるよ！[r]
+二人は市場の人混みの中へ消えていった。[r]
+[return]
+
+*stay
+[cm]
+[name="エレン"]
+今日は家でゆっくり休もう。[r]
+[name="ミア"]
+えー、つまらないの！[r]
+[return]

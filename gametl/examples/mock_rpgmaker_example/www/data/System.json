@@ -1,0 +1,13 @@
+{
+"gameTitle":"勇者の冒険",
+"terms":{
+"basic":["レベル","HP","MP","経験値"],
+"commands":["戦う","逃げる","アイテム","スキル"],
+"messages":{
+"actionFailure":"%1は何もしなかった。",
+"actorDamage":"%1は%2のダメージを受けた！",
+"actorRecovery":"%1のHPが%2回復した。",
+"victory":"%1を倒した！"
+}
+}
+}
