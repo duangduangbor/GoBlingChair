@@ -21,7 +21,31 @@ DEFAULT_SKIP_DIRS: Set[str] = {
     "__pycache__", ".git", ".svn", ".hg", "node_modules",
     "$RECYCLE.BIN", "System Volume Information",
     "_work", "_汉化输出", "_hanhua_output",
+    # ★ 安装器建的原版备份目录（patcher.BACKUP_DIRNAME）。
+    #   必须跳过，否则「装过汉化后再跑一次汉化椅」会把备份当成游戏本体
+    #   再扫一遍 → 词条翻倍、uid 全乱；更糟的是回填可能**改写原版备份**，
+    #   用户就再也还原不回原语言了。
+    "_汉化备份_原版",
 }
+
+# 备份产物一律不看（安装器的备份强制 `.bak` 后缀，见 patcher.BAK_SUFFIX）。
+# 放在这里统一兜底：任何引擎的文件筛选都不会再吃到 `.bak`。
+SKIP_FILE_SUFFIXES: Set[str] = {".bak", ".old", ".orig"}
+
+# 汉化工具**自己产出的目录**。这些目录名里带游戏名（`<游戏名>_汉化补丁包`），
+# 没法用精确名穷举，所以按前缀/后缀认。
+#
+# ⚠️ 不跳过会出真事：导出的补丁包就放在游戏根目录，里面有自己的
+#    `安装说明.txt`。第二次跑汉化时它会被当成游戏文本提取出来送去翻译
+#    —— 白烧算力，而且一旦回填就把说明文档改得面目全非。
+SKIP_TOOL_DIR_PREFIXES: tuple[str, ...] = ("_汉化", "_hanhua")
+SKIP_TOOL_DIR_SUFFIXES: tuple[str, ...] = ("_汉化补丁包",)
+
+
+def is_tool_dir(name: str) -> bool:
+    """判断目录名是不是汉化工具自己的产物（备份/输出/补丁包）。"""
+    return (name.startswith(SKIP_TOOL_DIR_PREFIXES)
+            or name.endswith(SKIP_TOOL_DIR_SUFFIXES))
 
 # 经验值：KiriKiri 的 .xp3 多在根目录，Ren'Py 的 .rpa 在 game/ 下
 DEFAULT_MAX_DEPTH = 4
@@ -68,6 +92,7 @@ def iter_files(root: Path,
     """
     root = Path(root)
     skip = DEFAULT_SKIP_DIRS | set(skip_dirs or ())
+    skip_sfx = SKIP_FILE_SUFFIXES
     st = stats or ScanStats()
 
     t0 = time.monotonic()
@@ -89,11 +114,16 @@ def iter_files(root: Path,
                 for e in it:
                     try:
                         if e.is_dir(follow_symlinks=False):
-                            if depth + 1 > max_depth or e.name in skip:
+                            if (depth + 1 > max_depth or e.name in skip
+                                    or is_tool_dir(e.name)):
                                 continue
                             st.dirs += 1
                             queue.append((Path(e.path), depth + 1))
                         elif e.is_file(follow_symlinks=False):
+                            # 备份产物（.bak/.old/.orig）不是游戏内容，不看也不计数
+                            _dot = e.name.rfind(".")
+                            if _dot > 0 and e.name[_dot:].lower() in skip_sfx:
+                                continue
                             if st.files >= max_files:
                                 st.truncated = True
                                 st.reason = f"超过 {max_files} 个文件上限"

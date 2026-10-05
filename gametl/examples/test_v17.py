@@ -85,6 +85,44 @@ def test_locate(tmp: Path) -> None:
         "从游戏内两层子目录也能向上找到游戏根（补丁包丢进游戏目录也能用）")
     rec(patcher.find_game_dir(tmp / "别处") is None, "无关目录返回 None")
 
+    # ---- 各引擎的根目录特征 ----
+    # 这里曾经漏了 Unity：`looks_like_game` 认 RPG Maker / Ren'Py / KiriKiri /
+    # Buddha，就是不认 `*_Data` —— 于是「汉化安装器」对着 Night in the Woods
+    # 的根目录弹「这个文件夹看着不太像游戏根目录」。
+    uni = tmp / "Unity游戏"
+    (uni / "Unity游戏_Data").mkdir(parents=True)
+    (uni / "Unity游戏.exe").write_bytes(b"MZ")
+    rec(patcher.looks_like_game(uni), "Unity（exe + *_Data）被认成游戏根")
+
+    df = tmp / "DF游戏"
+    (df / "Win" / "Packs").mkdir(parents=True)
+    (df / "DF游戏.exe").write_bytes(b"MZ")
+    (df / "Win" / "Packs" / "Stuff.~h").write_bytes(b"dfpf")
+    (df / "Win" / "Packs" / "Stuff.~p").write_bytes(b"xx")
+    rec(patcher.looks_like_game(df),
+        "Buddha（封包在 Win/Packs 子目录里）被认成游戏根")
+
+    rec(patcher.find_game_dir(uni / "Unity游戏_Data") == uni.resolve(),
+        "从 Unity 的 *_Data 子目录能向上找到游戏根")
+
+    # ---- 游戏指纹：说清「是不是**这个**游戏」，而不只是「像个游戏」----
+    fp = patcher.game_fingerprint(uni)
+    rec(fp.get("data_dirs") == ["Unity游戏_Data"], "指纹记下 *_Data 目录名")
+    rec(patcher.fingerprint_match(fp, uni)[0] == "match", "指纹自比 = match")
+    # 注意目录名别和后面 test_refuse 用的 "别的游戏" 撞（同一个 tmp 下）
+    other = tmp / "另一个游戏"
+    (other / "另一个游戏_Data").mkdir(parents=True)
+    (other / "另一个游戏.exe").write_bytes(b"MZ")
+    rec(patcher.fingerprint_match(fp, other)[0] == "mismatch",
+        "指纹比对另一个游戏 = mismatch")
+    rec(patcher.fingerprint_match({}, uni)[0] == "unknown",
+        "没指纹的老包 = unknown（只提示，不阻断安装）")
+    # 汉化工具自己的 exe 必须排除，否则两个不相干的游戏会因为
+    # 「都放了个汉化安装器.exe」而被判成「匹配」
+    (uni / "汉化安装器.exe").write_bytes(b"MZ")
+    rec("汉化安装器.exe" not in patcher.game_fingerprint(uni).get("exe", []),
+        "指纹排除汉化工具自己的 exe")
+
     st = patcher.patch_status(game)
     rec(st["installed"] is False, "没装过 → installed=False")
     rec(str(game) in st["backup_dir"], "状态里给出备份目录位置")

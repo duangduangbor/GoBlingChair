@@ -1,7 +1,8 @@
 # gametl —— 本地游戏文本汉化工具链
 
 用**本地大模型**（Ollama）驱动的游戏文本汉化流水线。不依赖任何在线翻译服务，
-数据不出本机。支持 KiriKiri、RPG Maker MV/MZ、Ren'Py、Unity 四类引擎。
+数据不出本机。支持 KiriKiri、RPG Maker MV/MZ、Ren'Py、Unity、
+Double Fine（Buddha / dfpf）、通用明文文本 六类引擎。
 
 > **法律提示**：本工具仅用于处理你**合法拥有**的游戏。逆向、修改、分发商业游戏的
 > 汉化补丁涉及版权问题，请自行确认合规性后再使用。
@@ -168,10 +169,28 @@ python -m gametl writeback p.json -o translated/
 | 形态 | 长相 | 处理方式 |
 |---|---|---|
 | **Yarn Spinner 对话脚本** | `Mae: 台词 #line:1519db` | 只替换冒号后的台词，说话人前缀与 `#line` 标签原样保留 |
+| **Yarn 箭头选项** | `-> 选项文字 <<命令>> #line:1519db` | 只换 `->` 之后的正文，前缀 / 内联命令 / `#line` / 缩进原样保留 |
+| **Yarn 方括号选项** | `[[选项文字\|跳转目标]] #line:1519db` | 只换**竖线左边**那段；`\|目标]]` / `#line` / 缩进原样保留 |
 | **CSV 文本表**（`*_lines`） | `line:a91c46,Mae: 台词,注释` | 只替换台词列，line code / 说话人 / 注释不动 |
 
+> ⚠️ **两种「选项行」都是玩家可见文本，不是结构标记。** 箭头式既用来做
+> 二选一，也常被拿来做「点击推进」的分句演出 —— Night in the Woods 的
+> 开场诗整段都是 `-> 一句` 的形式（**797 条**）；方括号式则是标准的选择支
+> （**262 条**，例如 `[[Isn't there supposed to be someone at the desk?|someone]]`）。
+> 早期版本把这两者分别当结构标记整行跳过，玩家看到的选项框一直是英文。
+> 只有后面什么都没有（纯 `<<jump>>`）时才跳过。
+>
+> ⚠️ 但 **`[[NodeName]]`（没有竖线）是纯节点跳转，一个字都不能动** ——
+> 判断依据是「有没有竖线」，不是「是不是以 `[[` 开头」。
+>
+> 正文里允许出现 `{locator=Left}` 属性块与 `[wave]…[/wave]` 标签，它们由
+> 保护机制换成占位符后再翻译、回填前还原。
+
 会自动跳过不该翻的东西：开源许可证文件、吉他和弦谱面数据
-（`00.000|8|0` 这类时间戳行）、版本号、FMOD 事件清单。
+（`00.000|8|0` 这类时间戳行）、版本号、FMOD 事件清单、
+**运行时日志**（`output_log.txt` / `Player.log` —— Unity 自己写的，会随每次
+开游戏不断变长），以及**汉化工具自己的产物**（`*_汉化补丁包/`、`_汉化输出/`、
+`_汉化备份_*`、`使用说明.txt`）。
 
 **依赖**：`UnityPy`（**必须用 1.10.x**，1.25+ 需要 Python 3.9+，本项目跑在 3.8）。
 打包版已内置，无需用户安装。
@@ -183,6 +202,72 @@ python -m gametl writeback p.json -o translated/
 > 实现细节：UnityPy 改完 `data.m_Script` 后**必须调 `data.save()`**
 > （它会 `set_raw_data` 更新原始字节），否则 `env.file.save()` 会原样吐回旧字节，
 > 表现为「日志说替换了 N 处，重新解包却一个字没变」。
+
+### Double Fine（Buddha / dfpf）
+
+Double Fine 自研引擎（Costume Quest 1·2、Stacking、Brutal Legend、Headlander、
+The Cave、Iron Brigade …）把资源装在 **dfpf 包**里：`Xxx.~h` 是索引、`Xxx.~p`
+是数据。游戏文本是以 TextAsset 形式存在的 **StringTable** 资源：
+
+```
+StringTable{LineCodeData={
+  CQ2_001=LineCodeData{Text="Well, hello there.";VolumeDB=0;Character=Mae;SoundCue=;};
+  ...
+};}
+```
+
+本工具**自己解包、自己回填**，不依赖任何外部工具，也不改动原游戏：
+
+```bash
+python -m gametl extract "E:/游戏/CostumeQuest2" -o p.json
+python -m gametl translate p.json
+python -m gametl writeback p.json -o translated/   # 产出改好的 .~h / .~p
+```
+
+覆盖与保护：
+
+| 处理 | 说明 |
+|---|---|
+| **只翻英语表** | 表名含 `usenglish` / `ukenglish` / `enus` / `engb` 才收；french / german / italian / leet 等一律跳过 |
+| **字体覆盖表** | `CMAP*` / `FONT*` 开头的是字形清单，不是文本，跳过 |
+| **按键宏** | `/BUTTON_DPadUp/`、`/KEY_LEFT/` 这类占位符自动保护，原样保留 |
+| **无损重排** | 解析时记下每个 `Text` 值在原文的区间，回填只换这几段 —— 其余字节逐字节不变 |
+
+回填走两条路，自动选择：
+
+1. **就地替换** —— 新文本压缩后装得进原槽位：只改 `.~p` 那一段（补 0 填充）、
+   再把索引里「解压后大小」几个比特改掉。`.~p` 总大小不变，最快最稳。
+2. **整包重建** —— 装不下（译文变长）：按偏移顺序重排包内所有资源、重算全部记录。
+
+> 格式依据：watto.org 的 Game Extractor 插件 `Archive_P_DFPF`（字段清单）+
+> [bgbennyboy/DoubleFine-Explorer](https://github.com/bgbennyboy/DoubleFine-Explorer)
+> （MPL-2.0，三种版本的逐字段读取顺序）。索引记录是 16 字节的**非对齐位域**、
+> 三版切法不同，所以本项目用**单比特探针**反推「字段 ↔ 记录位」映射再写回，
+> 而不是手写 pack/unpack 公式（见 `core/dfpf.py` 顶部注释）。
+
+### 通用明文文本（兜底）
+
+有些小制作/同人游戏根本不封包，文本就是散在目录里的 `.txt/.csv/.json/.xml`。
+这类没有统一格式，本工具按「后缀 + 内容形态」逐文件处理：
+
+| 后缀 | 处理方式 |
+|---|---|
+| `.txt .text .lang .strings .loc .md` | 逐行，整行即一条 |
+| `.csv .tsv` | 逐单元格（用 `csv.Sniffer` 判分隔符与引号风格） |
+| `.json` | 递归所有字符串值，按键路径定位 |
+| `.srt` | 只取字幕正文行（跳过序号与时间轴） |
+| `.ass .ssa` | 去掉 `{\an8}` 之类特效码后取正文 |
+| `.xml` | 文本节点 |
+| `.yaml .yml` | 标量值 |
+| `.po` | 只改 `msgstr "..."` 引号内部的译文 |
+
+回填保留原文件的编码 BOM、换行风格（CRLF/LF）与 JSON 缩进。
+安全边界：只处理能**严格 UTF-8 解码**、且小于 8MB 的文件，最多 400 个 —— 
+二进制文件、GBK 老文本一律不碰（宁可不做，也不改坏）。
+
+> 识别门槛：目录里有 exe + ≥3 个 ≥64 字节的文本文件 + 文本总量过 1KB，
+> 前面的专用引擎都没命中时才判定为 plaintext。宁可漏判走人工，
+> 也不误判把二进制当文本改。
 
 ### 新增引擎的约定（写提取器之前先看）
 
@@ -218,18 +303,21 @@ gametl/
 ├─ core/
 │  ├─ models.py              # TextUnit / Project 数据模型
 │  ├─ detect.py              # 引擎识别
+│  ├─ dfpf.py                # Double Fine dfpf 包（.~h/.~p）读写
 │  └─ protect.py             # 保护片段（变量/标签/转义符）
 ├─ extractors/
 │  ├─ base.py                # 提取器基类
 │  ├─ kirikiri.py            # KiriKiri (.ks)
 │  ├─ rpgmaker.py            # RPG Maker MV/MZ (JSON)
 │  ├─ renpy.py               # Ren'Py (.rpy)
-│  └─ unity.py               # Unity（UnityPy 解 .assets 的 TextAsset，改完写回）
+│  ├─ unity.py               # Unity（UnityPy 解 .assets 的 TextAsset，改完写回）
+│  ├─ buddha.py              # Double Fine（dfpf 包里的 StringTable）
+│  └─ plaintext.py           # 通用明文文本兜底（txt/csv/json/xml/srt/po/…）
 ├─ translators/
 │  ├─ glossary.py            # 术语表
 │  └─ ollama_backend.py      # Ollama 翻译后端
 ├─ glossary.example.json     # 术语表示例
-└─ examples/                 # 三个引擎的模拟测试工程
+└─ examples/                 # 各引擎的模拟测试工程
 ```
 
 ---
@@ -1328,3 +1416,84 @@ Tk 的 `Label` **不自动换行**，文字比容器宽就直接截断，用户�
    一关就抛 `RuntimeError: main thread is not in main loop`，被默认线程异常
    钩子记一笔堆栈。`install_thread_hook()` 只吞掉**这一种**（按消息匹配），
    其余照旧交给默认钩子 —— 不能顺手把真 bug 也捂掉。
+
+## 四十三、软件自带的翻译包仓库：一键汉化（v2.4）
+
+### 问题的形状
+
+「把翻译包作用到游戏上」这件事，v2.4 之前只有两条路，都不顺手：
+
+1. **主界面「导入翻译包」** —— 名字有误导性。它做的是「把译文预填进工程」，
+   然后**照样跑一遍完整流程**（含模型补漏），产出的是工程 + `_汉化输出/`。
+   用户要的是「直接把游戏汉化掉」，拿到的却是一份还得再导出的中间产物；
+   而且没有模型的机器上，它仍然会去拉引擎。
+2. **安装器模式** —— 能力是对的（`patcher.apply_patch`：就地覆盖 + 原版备份
+   + 可一键还原，零模型依赖），但要靠 `installer.want_installer()` 在启动时
+   分流：命令行带 `--installer`、文件名含「安装器」、或者 exe 不在软件目录而
+   身边躺着 `.gtpkg`。也就是说，**得先离开主界面**才能用上这个能力。
+
+于是「导出的补丁包」和「软件自身」是断开的：包发给了别人，自己反而用不上。
+
+### 做法：加一层「包仓库」，把 apply_patch 接到主界面
+
+```
+<软件目录>/packages/*.gtpkg     ← 软件自带的翻译包（推荐）
+<软件目录>/*.gtpkg              ← 顺手丢在根目录的也认
+```
+
+`core/package.py` 新增四个函数（都在数据层，不碰 GUI）：
+
+| 函数 | 职责 |
+|---|---|
+| `repo_dir(app_home)` | 仓库路径 = `<软件目录>/packages` |
+| `list_packages(app_home)` | 扫两个位置、读 manifest，返回结构化列表 |
+| `add_to_repo(app_home, src)` | 把外部 `.gtpkg` 收进仓库（重名不覆盖） |
+| `rank_packages(pkgs, game_dir)` | 打 match / partial / unknown / mismatch 并排序 |
+
+主界面新增卡片「一键汉化（用现成翻译包，免模型）」（卡片 4.5，夹在
+「校对与交付」和「运行时翻译」之间），底层直接调 `patcher.apply_patch` /
+`revert_patch` —— **一行 pipeline 代码都没走**，所以它天然不依赖 Ollama、
+不依赖 `models/`、不依赖网络。GUI 侧有独立线程 `self.pkg_thread`，**特意
+不复用 `self.worker`**：那条跑主流程要模型，这条完全不要，两者语义不同。
+
+### 几个刻意的决定
+
+1. **收包先验证，重名不覆盖。** `add_to_repo` 先 `read_manifest`（垃圾进不来），
+   再比内容摘要：**内容相同就复用**（免得用户重复点出两个副本），内容不同才
+   另存 `-2` / `-3`。直接覆盖很危险 —— 用户可能刚导出一个修好的包，手一滑
+   就把好的换成旧的。
+2. **读不出来的包要留在列表里。** `list_packages` 对坏包不丢、不抛，而是填一个
+   `error` 字段。否则它在界面上凭空消失，用户只会觉得「我明明放进去了」——
+   这比直接报错更让人困惑。
+3. **匹配结论只用来提示和排序，不用来拦截。** `fingerprint_match` 比的是
+   exe 名 / `*_Data` / 资源封包 / 关键目录名 —— 同一个游戏从不同渠道下载，
+   这些完全可能不一样。所以「对不上」只标红 + 二次确认，不禁止安装；
+   **真正的拦截交给 `apply_patch` 的匹配率**（uid 全失配且 < 5% 才中止）。
+4. **仓库目录只建不删。** `archive_all.py` 同步到 D 盘时只
+   `mkdir(exist_ok=True)` 并放一个说明文本，绝不 `rmtree` —— 里面的 `.gtpkg`
+   是用户自己的资产。
+
+### 与「导出补丁包」形成闭环
+
+```
+开始汉化（调模型翻一遍）
+      ↓
+📦 导出汉化补丁包  →  <游戏名>_汉化补丁包.zip（发给别人）
+      ↓  ➕ 收进软件
+   packages/<游戏名>_汉化翻译包.gtpkg
+      ↓  ✔ 汉化到所选游戏
+   游戏就地变中文（+ _汉化备份_原版/，可 ↩ 还原）
+```
+
+换台机器、或者游戏重装之后，只要包还在，**不需要模型就能复原汉化**。
+
+### 测试
+
+`test_v232_pkg_repo.py`（37 项）：目录约定、收包 / 去重 / 重名、扫描字段、
+坏包容错、匹配排序、`game_dir=None` 一律 unknown，外加两条静态检查 ——
+主界面确实接了 `apply_patch` / `revert_patch` / `list_packages` / `add_to_repo`，
+以及 `patcher.py` 里不许出现 `translators`（它是「免模型」的守门人）。
+
+端到端（临时副本，不碰真实游戏）：收包 → `verdict=match` → `apply_patch`
+改 4 个文件 / 命中 41 条 / 匹配率 100% → 文件内容真的变成中文 →
+`revert_patch` 4 个文件字节级还原、`installed=False`。

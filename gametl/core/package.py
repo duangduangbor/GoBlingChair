@@ -77,13 +77,19 @@ def export_package(project, dest: Path, *,
         progress(n, total)
 
     meta = project.meta or {}
+    game_dir = Path(str(meta.get("game_dir") or project.root))
+    # 函数内 import：patcher 反过来依赖本模块，顶层 import 会成环
+    from .patcher import game_fingerprint
     manifest = {
         "format": PACKAGE_FORMAT,
         "version": PACKAGE_VERSION,
         "tool_version": TOOL_VERSION,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "engine": project.engine.value,
-        "game": Path(str(meta.get("game_dir") or project.root)).name,
+        "game": game_dir.name,
+        # 游戏指纹：安装器据此确认「这个包配的就是这个游戏目录」。
+        # 只存名字（exe / *_Data / 封包 / 目录结构），不含任何游戏内容。
+        "fingerprint": game_fingerprint(game_dir),
         "target_lang": target_lang,
         "units_total": len(project.units),
         "units_translated": total,
@@ -459,3 +465,180 @@ def _bundle_readme(game_name: str, folder: str, pkg_name: str,
       译文 {pres['units']} 条 · {mb:.1f} MB（只有译文，不含游戏本体）
 * 安装说明.txt（本文件）
 """
+
+
+# ---------------------------------------------------------------- 包仓库
+
+#: 软件自带的翻译包目录名。
+#:
+#: 把导出的 ``.gtpkg`` 丢进这里，主界面「一键汉化」就能直接把它作用到
+#: 游戏上 —— 不需要模型、不需要联网、也不用把 exe 复制到包旁边。
+#: 这是「导出的补丁包回流到软件自身」的落点。
+REPO_DIRNAME = "packages"
+
+
+def repo_dir(app_home) -> Path:
+    """软件自带的翻译包目录（可能还不存在）。"""
+    return Path(app_home) / REPO_DIRNAME
+
+
+def _short_err(e: BaseException) -> str:
+    return f"{type(e).__name__}: {e}"[:160]
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """两个文件内容是否一致（翻译包只有几 MB，直接比摘要）。"""
+    import hashlib
+
+    def _h(p: Path) -> str:
+        h = hashlib.sha1()
+        with open(p, "rb") as fp:
+            for chunk in iter(lambda: fp.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    try:
+        return _h(a) == _h(b)
+    except OSError:
+        return False
+
+
+def list_packages(app_home) -> list[dict]:
+    """扫描软件自带的翻译包。
+
+    两个位置都收：
+
+    * ``<软件目录>/packages/*.gtpkg`` —— 推荐放这儿
+    * 软件根目录下散落的 ``*.gtpkg`` —— 用户随手丢的也能认出来
+
+    Returns:
+        每项 ``{"path", "name", "game", "engine", "units", "units_total",
+        "created_at", "size", "target_lang", "fingerprint", "error"}``，
+        按创建时间倒序。
+
+        **读不出来的包也保留在列表里**（``error`` 非空）—— 否则界面
+        上它会凭空消失，用户只会觉得「我明明放进去了」。
+    """
+    home = Path(app_home)
+    seen: set[str] = set()
+    cands: list[Path] = []
+    for d in (repo_dir(home), home):
+        try:
+            if not d.is_dir():
+                continue
+            for p in sorted(d.glob(f"*{PACKAGE_EXT}")):
+                if not p.is_file():
+                    continue
+                key = str(p.resolve()).lower()
+                if key not in seen:
+                    seen.add(key)
+                    cands.append(p)
+        except OSError:
+            continue
+
+    out: list[dict] = []
+    for p in cands:
+        rec: dict = {
+            "path": str(p), "name": p.name, "game": "", "engine": "",
+            "units": 0, "units_total": 0, "created_at": "", "size": 0,
+            "target_lang": "", "fingerprint": {}, "error": "",
+        }
+        try:
+            rec["size"] = p.stat().st_size
+        except OSError:
+            pass
+        try:
+            man = read_manifest(p)
+            rec.update({
+                "game": str(man.get("game") or ""),
+                "engine": str(man.get("engine") or ""),
+                "units": int(man.get("units_translated") or 0),
+                "units_total": int(man.get("units_total") or 0),
+                "created_at": str(man.get("created_at") or ""),
+                "target_lang": str(man.get("target_lang") or ""),
+                "fingerprint": man.get("fingerprint") or {},
+            })
+        except PackageError as e:
+            rec["error"] = str(e)
+        except Exception as e:  # noqa: BLE001
+            rec["error"] = _short_err(e)
+        out.append(rec)
+
+    out.sort(key=lambda r: (r["created_at"], r["name"]), reverse=True)
+    return out
+
+
+def add_to_repo(app_home, src) -> Path:
+    """把一个 ``.gtpkg`` 收进「软件自带」的翻译包目录。
+
+    重名**不覆盖** —— 自动加 ``-2``、``-3`` 后缀，免得手滑把好包冲掉。
+    但如果目标文件与来源**内容完全相同**，就直接复用，不制造副本。
+    """
+    import shutil
+
+    src = Path(src)
+    if not src.is_file():
+        raise PackageError(f"找不到文件：{src}")
+    man = read_manifest(src)            # 先验一遍，垃圾不进仓库
+
+    d = repo_dir(app_home)
+    d.mkdir(parents=True, exist_ok=True)
+    stem = _safe_name(man.get("game") or src.stem)
+    dst = d / f"{stem}_汉化翻译包{PACKAGE_EXT}"
+    i = 2
+    while dst.exists():
+        if _same_file(dst, src):
+            return dst                  # 收过一模一样的了，不再复制
+        dst = d / f"{stem}_汉化翻译包-{i}{PACKAGE_EXT}"
+        i += 1
+    shutil.copy2(src, dst)
+    return dst
+
+
+#: 匹配结论的排序权重（越大越靠前）
+_VERDICT_RANK = {"match": 3, "partial": 2, "unknown": 1, "mismatch": 0}
+
+VERDICT_LABEL = {
+    "match": "✔ 完全吻合",
+    "partial": "△ 部分吻合",
+    "unknown": "？ 无法判断",
+    "mismatch": "✖ 对不上",
+}
+
+
+def rank_packages(pkgs: list[dict], game_dir) -> list[dict]:
+    """给包列表打上「跟所选游戏配不配」的结论，并按贴合度排序。
+
+    结论来自 :func:`patcher.fingerprint_match`，**只用于提示与排序** ——
+    绝不用来阻止用户手动指定某个包。同一个游戏换个渠道下载，exe 名和
+    目录名都可能不一样，替用户下结论不合适。
+
+    Returns:
+        新列表（不改原对象），每项多出 ``verdict`` 与 ``verdict_text``。
+    """
+    if game_dir is None:
+        return [dict(r, verdict="unknown", verdict_text="还没选游戏")
+                for r in pkgs]
+
+    # 函数内 import：patcher 反过来依赖本模块，顶层 import 会成环
+    from .patcher import fingerprint_match
+
+    out: list[dict] = []
+    for r in pkgs:
+        rec = dict(r)
+        if rec.get("error"):
+            rec["verdict"] = "unknown"
+            rec["verdict_text"] = "包读不出来"
+        else:
+            try:
+                v, txt = fingerprint_match(rec.get("fingerprint") or {},
+                                           Path(game_dir))
+            except Exception as e:  # noqa: BLE001
+                v, txt = "unknown", _short_err(e)
+            rec["verdict"] = v
+            rec["verdict_text"] = txt
+        out.append(rec)
+
+    # 稳定排序：同分的保持 list_packages 给的「新的在前」顺序
+    out.sort(key=lambda r: _VERDICT_RANK.get(r["verdict"], 0), reverse=True)
+    return out

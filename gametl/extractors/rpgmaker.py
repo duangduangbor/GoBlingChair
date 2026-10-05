@@ -37,6 +37,15 @@ from .base import BaseExtractor, wb_stats
 CODE_MESSAGE = 401
 CODE_MESSAGE_CONT = 405
 
+# RPG Maker 的「显示选项」。``parameters[0]`` 是**选项文本数组** ——
+# 玩家逐条点选时读到的内容。这和 Yarn 的 ``-> 选项`` 是同一类东西：
+# 都是「最容易被漏掉、但玩家一定看得见」的文本。
+# 早期只认 401/405（对话正文），选项文本一条都没被提取过。
+CODE_CHOICES = 102
+# 「当[选项]」分支头。``parameters[1]`` 是引擎存的**选项文本副本**
+# （部分插件在重新显示选项时读它），所以两边都要翻，保持一致。
+CODE_CHOICES_WHEN = 402
+
 # 其他需要翻译的字段
 FIELD_KINDS: dict[str, TextKind] = {
     "name": TextKind.NAME,
@@ -280,16 +289,28 @@ class RPGMakerExtractor(BaseExtractor):
         return units
 
     def _extract_events(self, data: Any, rel: str) -> list[TextUnit]:
-        """处理事件型文件（CommonEvents / Map）。递归查找 401/405 指令。"""
+        """处理事件型文件（CommonEvents / Map）。递归查找 401/405/102/402 指令。"""
         units: list[TextUnit] = []
 
         def walk(node: Any, path: list) -> None:
             if isinstance(node, dict):
+                code = node.get("code")
                 # 事件指令形如 {"code": 401, "parameters": ["勇者", "你好。"]}
-                if node.get("code") == CODE_MESSAGE:
+                if code == CODE_MESSAGE:
                     params = node.get("parameters") or []
-                    speaker = params[0] if len(params) > 0 and isinstance(params[0], str) else ""
-                    body = params[1] if len(params) > 1 else ""
+                    # ⚠️ 401 的参数形状有**两种**写法，必须都认：
+                    #   · 两元素 ["说话人", "正文"]（本项目夹具 / 部分汉化约定）
+                    #   · 单元素 ["正文"]（原版 RPG Maker MV/MZ 的真实形状：
+                    #     说话人来自 101 的脸图设置，不在 401 里）
+                    # 早期写死 speaker=params[0] / body=params[1]，遇到单元素
+                    # 时正文会变成空串 —— 正文**恰好**还被 params[0] 兜住，
+                    # 「碰巧能翻」，但条目标成了 name、语义全错。
+                    if len(params) >= 2:
+                        speaker = params[0] if isinstance(params[0], str) else ""
+                        body = params[1] if isinstance(params[1], str) else ""
+                    else:
+                        speaker = ""
+                        body = params[0] if params and isinstance(params[0], str) else ""
                     if _is_translatable(body):
                         units.append(self._mk(
                             rel, {"event_path": path, "code": 401}, body,
@@ -300,8 +321,28 @@ class RPGMakerExtractor(BaseExtractor):
                         units.append(self._mk(
                             rel, {"event_path": path, "code": 401, "part": "speaker"},
                             speaker, TextKind.NAME))
+                elif code == CODE_CHOICES:
+                    # 显示选项：parameters[0] 是选项文本数组
+                    params = node.get("parameters") or []
+                    choices = params[0] if params and isinstance(params[0], list) else []
+                    for ci, t in enumerate(choices):
+                        if _is_translatable(t):
+                            units.append(self._mk(
+                                rel, {"event_path": path, "code": 102,
+                                      "choice": ci},
+                                t, TextKind.UI,
+                                context={"choice_index": ci}))
+                elif code == CODE_CHOICES_WHEN:
+                    # 「当[选项]」：parameters = [选项序号, 选项文本副本]
+                    params = node.get("parameters") or []
+                    if len(params) > 1 and _is_translatable(params[1]):
+                        units.append(self._mk(
+                            rel, {"event_path": path, "code": 402}, params[1],
+                            TextKind.UI))
                 for k, v in node.items():
-                    if k == "parameters" and node.get("code") in (CODE_MESSAGE, CODE_MESSAGE_CONT):
+                    if (k == "parameters"
+                            and code in (CODE_MESSAGE, CODE_MESSAGE_CONT,
+                                         CODE_CHOICES, CODE_CHOICES_WHEN)):
                         continue
                     walk(v, path + [k])
             elif isinstance(node, list):
@@ -664,11 +705,27 @@ class RPGMakerExtractor(BaseExtractor):
                 node = data
                 for key in loc["event_path"]:
                     node = node[key]
-                # node 是 code=401 的指令 dict
-                if loc.get("part") == "speaker":
-                    node["parameters"][0] = value
+                code = loc.get("code")
+                params = node.get("parameters")
+                # 显示选项：parameters[0] 是选项文本数组
+                if code == 102:
+                    params[0][loc["choice"]] = value
+                    return True
+                # 「当[选项]」：parameters[1] 是选项文本副本
+                if code == 402:
+                    params[1] = value
+                    return True
+                # 401 显示文字。参数形状有两种（见 _extract_events）：
+                # 两元素是 [说话人, 正文]，单元素是 [正文]。
+                if isinstance(params, list) and len(params) >= 2:
+                    if loc.get("part") == "speaker":
+                        params[0] = value
+                    else:
+                        params[1] = value
+                elif isinstance(params, list) and params:
+                    params[0] = value
                 else:
-                    node["parameters"][1] = value
+                    return False
                 return True
 
             if loc.get("field") == "terms":

@@ -22,6 +22,8 @@ class EngineType(str, Enum):
     UNITY = "unity"            # Unity 引擎
     RPGMAKER_MV = "rpgmaker_mv"    # RPG Maker MV / MZ
     RENPY = "renpy"            # Ren'Py
+    BUDDHA = "buddha"          # Double Fine 系（.~h/.~p 的 dfpf 包）
+    PLAINTEXT = "plaintext"    # 无引擎特征的明文文本目录（通用兜底）
     UNKNOWN = "unknown"
 
 

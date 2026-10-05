@@ -29,14 +29,46 @@ from ..core.models import Project, TextKind, TextUnit
 from ..core.protect import protect, restore
 from ..core.scan import iter_files
 from .base import BaseExtractor, wb_stats, write_back_file
+from .yarn import (
+    BRACKET_RE as YARN_BRACKET_CHOICE_RE,
+    iter_statements as iter_yarn_statements,
+    split_speaker as yarn_split_speaker,
+    split_statement,
+)
 
 TEXT_SUFFIXES = {".txt", ".json", ".csv", ".tsv", ".xml", ".yaml", ".yml"}
 
-# Yarn Spinner 对话行：`说话人: 台词`（可带缩进）。说话人后紧跟冒号+空格。
+# ---------------------------------------------------------------------------
+# Yarn：语法判定已迁移到 ``gametl/extractors/yarn.py``
+#
+# 早期这里是「扁平正则扫描」：逐行套几条正则猜哪些行是台词。每遇到一种
+# 新形态就得补一条正则，历史上因此返工两次（先漏 `->` 选项 797 条，再漏
+# `[[文本|目标]]` 选项 262 条）。现在改为**按官方编译器语法解析**，见
+# yarn.py 的模块文档。下面这些常量只为兼容早期调用方与测试保留。
+# ---------------------------------------------------------------------------
 YARN_LINE_RE = re.compile(r"^(\s*)([A-Za-z][\w ]*):\s*(.+)$")
-# 需要整体跳过的 Yarn 行类型：元数据 / 选项 / 逻辑 / 跳转 / 分隔
-YARN_SKIP_PREFIXES = ("title:", "tags:", "colorID:", "position:", "->", "<<", "[[", "===")
+# 早期「扁平扫描」用的跳过前缀；新解析器靠节点状态区分头部/正文，
+# 不再依赖它，但自检脚本仍在引用，故保留。
+YARN_SKIP_PREFIXES = ("title:", "tags:", "colorID:", "position:", "<<", "[[", "===")
 YARN_SKIP_EXACT = {"---", ""}
+# 选项行前缀：`-> 正文`（`->` 与正文之间可能没有空格）
+YARN_CHOICE_PREFIX_RE = re.compile(r"^(\s*->\s*)")
+# 选项行「尾部」要原样保留的记号：<<命令>> / #line:xx / #tag
+YARN_TAIL_RE = re.compile(r"(\s*(?:<<[^>]*>>|#[\w:.\-]+))+\s*$")
+
+# 受保护占位 token（【0】【1】…）
+_PLACEHOLDER_RE = re.compile(r"\u3010\d+\u3011")
+
+
+def _has_real_text(text: str) -> bool:
+    """正文里除受保护片段外，是否还有真正需要翻译的文字。
+
+    ``$grocery_box``、``{locator=Left}``、``%s`` 这种整行只剩变量/标签的
+    行，保护后一个字母都不剩 —— 不该送去翻译（翻不出东西，还平白让回填
+    多一次无谓改动）。
+    """
+    prot, _frags = protect(text)
+    return _is_translatable(_PLACEHOLDER_RE.sub("", prot))
 
 # *_lines 的 CSV 表头
 LINES_HEADER = "LineCode"
@@ -61,6 +93,36 @@ def _is_translatable(text: str) -> bool:
     return True
 
 
+def _split_choice_line(line: str) -> tuple[str, str, str] | None:
+    """把一条 Yarn 选项行拆成 ``(前缀, 正文, 尾部)``。
+
+    ``-> 正文 <<命令>> #line:xxx // 注释`` 拆成三块，只有「正文」是
+    该翻译的，其余原样保留。返回 ``None`` 表示这行不是选项行。
+
+    正文可以为空（纯命令/纯跳转选项），调用方自行判断要不要提取。
+    """
+    m = YARN_CHOICE_PREFIX_RE.match(line)
+    if not m:
+        return None
+    prefix = m.group(1)
+    rest = line[m.end():]
+
+    # 先切出行尾注释（`//` 到行尾）—— 注释里也常有 #line:xxx
+    comment = ""
+    cm = re.search(r"\s//", rest)
+    if cm:
+        comment = rest[cm.start():]
+        rest = rest[:cm.start()]
+
+    # 再从尾部剥掉 <<命令>> / #line:xxx / #tag
+    tail = ""
+    tm = YARN_TAIL_RE.search(rest)
+    if tm:
+        tail = rest[tm.start():]
+        rest = rest[:tm.start()]
+    return prefix, rest, tail + comment
+
+
 def _has_unitypy() -> bool:
     try:
         import UnityPy  # noqa: F401
@@ -83,16 +145,26 @@ class UnityExtractor(BaseExtractor):
         # --- 模式 1：纯文本资源 ---
         text_files = [p for p in iter_files(self.decoded_dir)
                       if p.suffix.lower() in TEXT_SUFFIXES]
-        # 过滤掉明显的配置/代码文件 + 许可证/法律文本
-        skip_names = {"package.json", "manifest.json", "ProjectVersion.txt",
-                      "boot.config", "app.info", "Legal.txt", "license.txt",
-                      "LICENSE", "COPYING", "NOTICE", "README.txt"}
-        skip_parts = ("/Legal", "/Licenses", "/legal")
+        # 过滤掉明显的配置/代码文件 + 许可证/法律文本 + 运行时日志。
+        # 全部小写比对（Windows 文件名大小写随意，`Readme.txt` 也得认出来）。
+        skip_names = {"package.json", "manifest.json", "projectversion.txt",
+                      "boot.config", "app.info", "legal.txt", "license.txt",
+                      "licence.txt", "copying", "notice", "readme.txt",
+                      # Unity 运行时自己写的日志，不是游戏内容。
+                      # NITW 的 output_log.txt 有 2262 行，会被逐行当成
+                      # 对话文本提取 —— 而且它随每次运行游戏不断变长，
+                      # 让「提取条数」变成一个会漂移的数字。
+                      "output_log.txt", "player.log", "player-prev.log",
+                      "error.log", "crash.dmp",
+                      # 汉化工具自己的说明书（常被用户连着 exe 一起放进游戏目录）
+                      "使用说明.txt", "安装说明.txt",
+                      "启动.bat"}
+        skip_parts = ("/legal", "/licenses")
         for path in text_files:
-            if path.name in skip_names:
+            if path.name.lower() in skip_names:
                 continue
             rel = str(path.relative_to(self.decoded_dir)).replace("\\", "/")
-            if any(part in rel for part in skip_parts):
+            if any(part in rel.lower() for part in skip_parts):
                 continue
             suf = path.suffix.lower()
             try:
@@ -192,6 +264,8 @@ class UnityExtractor(BaseExtractor):
         except ImportError:
             return units
 
+        # 注意：`.assets` 的松散匹配是为了兼容 split 出来的同名前缀文件；
+        # 备份产物（*.assets.bak 等）已由 core.scan.iter_files 统一剔除。
         targets = [p for p in iter_files(self.decoded_dir)
                    if p.suffix.lower() in (".assets", ".bundle", ".unity3d")
                    or ".assets" in p.name]
@@ -248,28 +322,59 @@ class UnityExtractor(BaseExtractor):
 
     def _extract_yarn(self, rel: str, loc_base: dict,
                       text: str) -> list[TextUnit]:
-        """解析 Yarn Spinner 脚本：只提取 `说话人: 台词` 行。
+        """解析 Yarn Spinner 脚本，提取**全部**玩家可见文本。
 
-        跳过：title/tags/colorID/position 元数据、-> 选项、<<逻辑>>、
-        [[跳转]]、=== 分隔、空行。台词行尾的 #line:xxxx 由 protect 保护。
+        判定逻辑全部在 ``gametl/extractors/yarn.py``（按官方编译器语法 +
+        节点状态机），本方法只负责把结果包装成 TextUnit。覆盖四种写法：
+
+        1. ``说话人: 台词`` / ``无说话人的裸台词`` —— 普通对话
+           （``Empty Text #line:22a818``、``1 - Succotash #line:3751d9``
+           都是合法台词，早期实现强制要求有说话人，把这一类整类漏掉）
+        2. ``-> 正文``    —— 箭头式选项（也常被拿来做「点击推进」的分句演出，
+           Night in the Woods 的开场诗整段都是这个形式）
+        3. ``=> 正文``    —— Yarn 3.x 的行组（line group），同样是玩家可见文本
+        4. ``[[正文|目标]]`` —— 方括号式选项（只有带竖线的才是选项，
+           ``[[NodeName]]`` 是纯节点跳转，必须跳过）
+
+        跳过：头部区 header（``title:``/``tags:``/``colorID:``/``position:``
+        以及任意自定义 header）、``<<命令>>``、``===``/``---`` 分隔、注释、
+        空行、以及正文里只剩变量/标签的行。行尾的 ``#line:xxxx``、内联
+        ``<<命令>>`` 与正文里的 ``{属性}``/``[标签]`` 由 protect 保护，
+        回填时原样拼回。
         """
         units: list[TextUnit] = []
-        for i, line in enumerate(text.splitlines(), 1):
-            stripped = line.strip()
-            if stripped in YARN_SKIP_EXACT or not stripped:
+        for st in iter_yarn_statements(text):
+            speaker, _sp_prefix, body = yarn_split_speaker(st.text)
+            # 兼容既有的 uid 约定（翻译记忆按 original 字符串命中，
+            # 改动它会让大家已有的译文全部失效）：
+            #   · 普通台词：original = 冒号后的原文（**含**行尾 #line 等）
+            #   · 选项/行组/方括号选项：original = 纯正文
+            original = (body + (st.tail if st.kind == "line" else "")).strip()
+            if not _has_real_text(original):
                 continue
-            if stripped.startswith(YARN_SKIP_PREFIXES):
-                continue
-            m = YARN_LINE_RE.match(line)
-            if not m:
-                continue
-            body = m.group(3).strip()
-            if not _is_translatable(body):
-                continue
-            speaker = m.group(2).strip()
+
+            loc = dict(loc_base)
+            loc["line"] = st.line_no
+            if st.kind == "line":
+                loc["yarn"] = True
+                # 注：普通台词**始终**带 speaker 键（可能为空串），
+                # 与历史 uid 保持一致
+                loc["speaker"] = speaker
+            elif st.kind == "option":
+                loc["yarn_choice"] = True
+                if speaker:
+                    loc["speaker"] = speaker
+            elif st.kind == "group":
+                loc["yarn_group"] = True
+                if speaker:
+                    loc["speaker"] = speaker
+            else:                                  # bracket
+                loc["yarn_bracket"] = True
+                if speaker:
+                    loc["speaker"] = speaker
+
             units.append(self._mk(
-                rel, {**loc_base, "line": i, "yarn": True, "speaker": speaker},
-                body, TextKind.DIALOGUE,
+                rel, loc, original, TextKind.DIALOGUE,
                 context={"speaker": speaker} if speaker else None))
         return units
 
@@ -458,6 +563,21 @@ class UnityExtractor(BaseExtractor):
                     line, ok = _replace_csv_line_text(line, u, val)
                     if ok:
                         n += 1
+                elif u.location.get("yarn_bracket"):
+                    # Yarn 选项行：`[[正文|目标]] #line:xxx`
+                    line, ok = _replace_yarn_bracket_text(line, u, val)
+                    if ok:
+                        n += 1
+                elif u.location.get("yarn_choice"):
+                    # Yarn 选项行：`-> 正文 <<命令>> #line:xxx`
+                    line, ok = _replace_yarn_choice_text(line, u, val)
+                    if ok:
+                        n += 1
+                elif u.location.get("yarn_group"):
+                    # Yarn 3.x 行组：`=> 正文 #line:xxx`
+                    line, ok = _replace_yarn_group_text(line, u, val)
+                    if ok:
+                        n += 1
                 elif u.location.get("yarn"):
                     # Yarn 行：`说话人: 台词 #line:xxx`，只替换台词
                     line, ok = _replace_yarn_line_text(line, u, val)
@@ -527,29 +647,72 @@ class UnityExtractor(BaseExtractor):
         return n, write_back_file(src, dst, payload)[1]
 
 
-def _replace_yarn_line_text(line: str, u: TextUnit, val: str) -> tuple[str, bool]:
-    """替换 Yarn 行 `说话人: 台词 #line:xxx` 里的台词部分。
+def _splice_yarn_line(line: str, u: TextUnit, val: str,
+                      expect: str) -> tuple[str, bool]:
+    """回填一条 Yarn 语句：只替换正文，其余一个字节都不动。
 
-    只替换冒号后的正文，保留说话人前缀与缩进。``val`` 已经过 protect/restore
-    还原，本身含完整的正文（含 #line 标签），故直接整体替换、不再追加标签。
+    用与提取**同一套**语法解析重新切开当前行（``split_statement``），
+    校验正文与原文一致后才替换；对不上就整行不动 —— 宁可漏翻一条，
+    也绝不把脚本写坏。
+
+    ``expect`` 是期望的语句类型（``line`` / ``option`` / ``group`` /
+    ``bracket``），类型不符也一律不动。
+
+    替换区间按「该类型 original 的语义」决定：
+
+    - ``line``：译文里**含**行尾 ``#line``/``<<命令>>``（由 protect 保护、
+      restore 还原），所以替换到行尾；
+    - 其余：译文是纯正文，行尾结构尾巴（``|目标]]``/``<<命令>>``/``#line``）
+      必须原样保留，故只替换正文那一段。
     """
-    m = YARN_LINE_RE.match(line)
-    if not m:
+    st = split_statement(line)
+    if st is None or st.kind != expect:
         return line, False
-    speaker_part = m.group(2)
-    rest = m.group(3)
-    # 校验正文一致才替换：去掉行尾 #line 标签后与原文比对
-    body = rest.rstrip()
-    mm = re.search(r"(#line:[0-9a-fA-F]+)\s*$", body)
-    if mm:
-        body = body[:mm.start()].rstrip()
-    orig_body = u.original
-    om = re.search(r"(#line:[0-9a-fA-F]+)\s*$", orig_body)
-    if om:
-        orig_body = orig_body[:om.start()].rstrip()
-    if body != orig_body.strip():
+    _name, sp_prefix, body = yarn_split_speaker(st.text)
+    check = (body + (st.tail if expect == "line" else "")).strip()
+    if check != (u.original or "").strip():
         return line, False
-    return m.group(1) + speaker_part + ": " + val, True
+    body_start = len(st.prefix) + len(sp_prefix)
+    if expect == "line":
+        return line[:body_start] + val, True
+    body_end = len(st.prefix) + len(st.text)
+    return line[:body_start] + val + line[body_end:], True
+
+
+def _replace_yarn_bracket_text(line: str, u: TextUnit, val: str) -> tuple[str, bool]:
+    """替换 Yarn 1.x 快捷选项 ``[[正文|目标]] #line:xxx`` 里的正文。
+
+    只动竖线左边那一段：缩进、``[[``、``|目标]]``、行尾 ``#line`` 全部
+    原样拼回。正文里的 ``{locator=..}`` 属性与 ``[wave]..[/wave]`` 标签由
+    protect 保护，``val`` 已是还原后的完整正文，直接整体替换即可。
+    """
+    return _splice_yarn_line(line, u, val, "bracket")
+
+
+def _replace_yarn_line_text(line: str, u: TextUnit, val: str) -> tuple[str, bool]:
+    """替换 Yarn 普通的「台词行」正文（**允许没有说话人前缀**）。
+
+    只替换说话人之后的正文，保留说话人前缀与缩进。``val`` 已经过
+    protect/restore 还原，本身含完整的正文（含 #line 标签），故直接
+    整体替换、不再追加标签。
+    """
+    return _splice_yarn_line(line, u, val, "line")
+
+
+def _replace_yarn_choice_text(line: str, u: TextUnit, val: str) -> tuple[str, bool]:
+    """替换 Yarn 选项行 ``-> 正文 <<命令>> #line:xxx`` 里的正文。
+
+    只动「正文」这一段，``->`` 前缀、行尾 ``#line``/``<<命令>>``/``// 注释``
+    与正文前导空白全部原样拼回 —— 少改一个字节就少一分写坏脚本的风险。
+    选项正文带说话人前缀时（``-> Captain: 台词``，Yarn 3.x 允许），
+    说话人同样原样保留。
+    """
+    return _splice_yarn_line(line, u, val, "option")
+
+
+def _replace_yarn_group_text(line: str, u: TextUnit, val: str) -> tuple[str, bool]:
+    """替换 Yarn 3.x 行组 ``=> 正文 #line:xxx`` 里的正文。"""
+    return _splice_yarn_line(line, u, val, "group")
 
 
 def _replace_csv_line_text(line: str, u: TextUnit, val: str) -> tuple[str, bool]:

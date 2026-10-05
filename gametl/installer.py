@@ -113,6 +113,7 @@ class InstallerApp:
         self.base = exe_dir()
         self.game_dir: Path | None = None
         self.pkg: Path | None = None
+        self.pkg_meta: dict | None = None     # 翻译包的 manifest（含游戏指纹）
         self.worker: threading.Thread | None = None
         self.cancel_event = threading.Event()
         self.logq: queue.Queue = queue.Queue()
@@ -205,6 +206,12 @@ class InstallerApp:
                   activeforeground="white", relief="flat", cursor="hand2",
                   font=("Microsoft YaHei UI", 10, "bold"),
                   padx=12, pady=5).pack(side="left", padx=(8, 0))
+        # 指纹比对结论：光说「像个游戏目录」不够，得说清「是不是**这个**游戏」
+        self.match_label = tk.Label(
+            i1, text="", bg=CARD, fg=MUTED, anchor="w", justify="left",
+            font=("Microsoft YaHei UI", 9))
+        self.match_label.pack(fill="x", pady=(6, 0))
+        wrap_to_parent(self.match_label, i1, pad=16)
 
         # 翻译包
         c2 = tk.Frame(body, bg=CARD, highlightbackground="#e5e7eb",
@@ -339,8 +346,12 @@ class InstallerApp:
             g = patcher.find_game_dir(d.parent)
         if g is not None:
             self._set_game(g)
+            self._log(f"自动找到了游戏目录：{g}", "ok")
         else:
             self.game_var.set("（没自动找到，请手动选择游戏文件夹）")
+            self._log("没能自动认出游戏目录，请点「选择…」手动指一下。"
+                      "（把本程序放在游戏根目录、或游戏根目录的子文件夹里，"
+                      "再双击它，通常就能自动找到。）", "warn")
 
         # 翻译包：自己这层 → 上一层
         found: list[Path] = []
@@ -369,14 +380,49 @@ class InstallerApp:
     def _set_pkg(self, p: Path) -> None:
         self.pkg = Path(p)
         self.pkg_var.set(str(self.pkg))
+        self.pkg_meta = self._read_pkg_meta(self.pkg)
         self._render_state()
+
+    @staticmethod
+    def _read_pkg_meta(p: Path) -> dict | None:
+        """读翻译包的 manifest（含游戏指纹）。读不出就当没有，不打断用户。"""
+        try:
+            from .core.package import read_manifest
+            return read_manifest(p)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _verify_root(self, p: Path) -> tuple[str, str]:
+        """拿翻译包的指纹比对目录，返回 ``(结论, 说明)``。"""
+        fp = (self.pkg_meta or {}).get("fingerprint") or {}
+        return patcher.fingerprint_match(fp, p)
 
     def _render_state(self) -> None:
         if self.game_dir is None:
             self.state_label.configure(
                 text="先告诉我要装在哪个游戏里。", fg=MUTED)
+            self.match_label.configure(text="", fg=MUTED)
             self.revert_btn.configure(state="disabled")
             return
+        # 指纹结论：光「像个游戏目录」不够，要说清「是不是**这个**游戏」
+        if self.pkg_meta is None:
+            self.match_label.configure(
+                text=("（翻译包选了之后，会自动核对是不是同一个游戏）"
+                      if self.pkg is None else ""), fg=MUTED)
+        else:
+            verdict, why = self._verify_root(self.game_dir)
+            if verdict == "match":
+                self.match_label.configure(text=f"✅ 与翻译包匹配：{why}",
+                                           fg=OK_GREEN)
+            elif verdict == "partial":
+                self.match_label.configure(
+                    text=f"⚠️ {why} —— 版本可能不同，能装但留个心眼", fg=WARN_AMBER)
+            elif verdict == "mismatch":
+                self.match_label.configure(
+                    text=f"❌ {why}。是不是选错文件夹，或者包不是这个游戏的？",
+                    fg=ERR_RED)
+            else:
+                self.match_label.configure(text=why, fg=MUTED)
         if self.status.get("installed"):
             self.state_label.configure(
                 text=(f"✅ 这个游戏已经装了汉化（{self.status['files']} 个文件，"
@@ -399,7 +445,7 @@ class InstallerApp:
 
     def pick_game(self) -> None:
         d = filedialog.askdirectory(
-            title="选择游戏文件夹（里面通常有 www 目录）",
+            title="选择游戏文件夹（exe 和游戏数据所在的那一层）",
             initialdir=str(self.game_dir or self.base))
         if not d:
             return
@@ -408,11 +454,19 @@ class InstallerApp:
             g = patcher.find_game_dir(p, max_up=2)
             if g is not None:
                 p = g
-            elif not messagebox.askyesno(
-                    APP_NAME,
-                    f"这个文件夹看着不太像游戏根目录：\n{p}\n\n"
-                    "仍然使用它吗？"):
-                return
+            else:
+                # 引擎特征认不出来 ≠ 选错了。先用翻译包的指纹对一次：
+                # 对得上就静默接受（比如老 Unity / 冷门引擎的目录），
+                # 免得用户被一句「不太像游戏目录」反复劝退。
+                verdict, why = self._verify_root(p)
+                if verdict == "match":
+                    self._log(f"目录特征不明显，但它和翻译包吻合（{why}），用它。",
+                              "ok")
+                elif not messagebox.askyesno(
+                        APP_NAME,
+                        f"这个文件夹看着不太像游戏根目录：\n{p}\n\n"
+                        "仍然使用它吗？"):
+                    return
         self._set_game(p)
 
     def pick_pkg(self) -> None:

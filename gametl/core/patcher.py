@@ -68,6 +68,51 @@ def _step(on_progress: ProgressCb, cur: int, total: int, desc: str) -> None:
             pass
 
 
+def _walk_dirs_limited(root: Path, max_depth: int = 2,
+                       max_dirs: int = 60) -> list[Path]:
+    """逐层收集子目录，**总目录数封顶**。
+
+    ``looks_like_game`` 会被「向上找游戏根目录」反复调用，用户随手选个
+    ``D:\\`` 也不能卡住界面 —— 所以这里不能无限递归，也不能全量枚举。
+    """
+    seen = [root]
+    level = [root]
+    for _ in range(max_depth):
+        nxt: list[Path] = []
+        for d in level:
+            try:
+                for e in d.iterdir():
+                    if e.is_dir():
+                        nxt.append(e)
+                    if len(seen) + len(nxt) >= max_dirs:
+                        break
+            except OSError:
+                continue
+            if len(seen) + len(nxt) >= max_dirs:
+                break
+        level = nxt[:max_dirs]
+        seen.extend(level)
+        if not level or len(seen) >= max_dirs:
+            break
+    return seen[:max_dirs]
+
+
+def _has_pack_pair(root: Path, max_depth: int = 2) -> bool:
+    """``root`` 往下 ``max_depth`` 层内，有没有**成对**的 ``.~h`` + ``.~p``。
+
+    Costume Quest 2 把封包放在 ``Win/Packs/`` 里，只 glob 根目录会漏；
+    但要往下看就得上限，否则大目录上会拖死界面。
+    """
+    for d in _walk_dirs_limited(root, max_depth=max_depth):
+        try:
+            for h in d.glob("*.~h"):
+                if h.is_file() and h.with_suffix(".~p").is_file():
+                    return True
+        except OSError:
+            continue
+    return False
+
+
 def looks_like_game(path: Path) -> bool:
     """这条路看着像不像一个游戏目录。"""
     p = Path(path)
@@ -93,7 +138,135 @@ def looks_like_game(path: Path) -> bool:
             return True
     except OSError:
         pass
+    # Double Fine 系（Buddha/Moai）：.~h 索引 + .~p 数据成对出现，特征极强。
+    # **要往下看两层** —— Costume Quest 2 把它们放在 Win/Packs/ 里，
+    # 只 glob 根目录会漏，安装器就会把游戏根目录判成「不像游戏」。
+    try:
+        if _has_pack_pair(p, max_depth=2):
+            return True
+    except OSError:
+        pass
+    # Unity：`Xxx_Data/` 目录（同级还有可执行文件）或 UnityPlayer.dll。
+    # 这条**曾经漏掉过** —— 结果安装器对着 Night in the Woods 这类 Unity
+    # 游戏的根目录说「看着不太像游戏根目录」，用户只能点「是」硬闯。
+    # 只认 `*_Data` 不够（随便一个目录都可能叫 foo_Data），所以要求
+    # 同层同时存在 .exe 或 UnityPlayer.dll。
+    try:
+        if any(p.glob("UnityPlayer.dll")):
+            return True
+        # 只读一次目录、且封顶 4000 项：用户可能随手选了 `D:\` 这种大目录，
+        # 全量 iterdir 会卡住界面。
+        entries = []
+        for i, e in enumerate(p.iterdir()):
+            if i >= 4000:
+                break
+            entries.append(e)
+        has_exe = any(e.is_file() and e.suffix.lower() == ".exe" for e in entries)
+        if has_exe and any(e.is_dir() and e.name.endswith("_Data")
+                           for e in entries):
+            return True
+    except OSError:
+        pass
     return False
+
+
+# ---------------------------------------------------------------- 游戏指纹
+
+#: 每类特征最多记几个名字（比对够用即可，不必全存）
+FP_MAX_NAMES = 12
+
+#: 认得出引擎的关键子目录名（小写比对）
+FP_INTERESTING_DIRS = ("www", "game", "renpy", "data", "js", "managed",
+                       "streamingassets", "win", "packs", "resources")
+
+#: 采集指纹时要排除的文件名 —— 汉化工具自己会被用户丢进游戏目录，
+#: 要是它成了「共同特征」，两个毫不相干的游戏也会被判成「匹配」。
+FP_SKIP_NAMES = {"汉化安装器.exe", "滚刀哥布林汉化椅.exe", "gametl.exe"}
+
+
+def _fp_names(paths) -> list[str]:
+    out: list[str] = []
+    for p in sorted(paths, key=lambda q: q.name.lower()):
+        if p.name in FP_SKIP_NAMES:
+            continue
+        out.append(p.name)
+        if len(out) >= FP_MAX_NAMES:
+            break
+    return out
+
+
+def _fp_overlap(a, b) -> bool:
+    """两组名字有没有交集（**大小写不敏感** —— 换台机器/换个渠道，
+    ``Win`` 写成 ``win``、``Data`` 写成 ``data`` 都不该影响判断）。"""
+    return bool({str(x).lower() for x in a} & {str(x).lower() for x in b})
+
+
+def game_fingerprint(path: Path) -> dict:
+    """采集游戏根目录的「指纹」，用于确认「这个汉化包配的是这个游戏」。
+
+    只记**名字**，不记内容、不记大小：exe 名、``*_Data`` 目录名、资源封包名、
+    关键子目录名。这样既够用来揪出「选错文件夹 / 装到别的游戏上」，又不会
+    因为同一个游戏不同渠道的版本差异（文件大小各异）而误报，也绝不泄露
+    任何游戏内容。
+    """
+    p = Path(path)
+    fp: dict = {}
+    if not p.is_dir():
+        return fp
+    try:
+        entries = list(p.iterdir())
+    except OSError:
+        return fp
+    dirs = [d for d in entries if d.is_dir()]
+    fp["dir"] = p.name
+    fp["exe"] = _fp_names(x for x in entries if x.is_file() and x.suffix.lower() == ".exe")
+    fp["data_dirs"] = _fp_names(d for d in dirs if d.name.endswith("_Data"))
+    packs = []
+    for pat in ("*.xp3", "*.rpa", "*.~h", "*.pck", "*.assets", "*.bundle"):
+        try:
+            packs.extend(x for x in p.glob(pat) if x.is_file())
+        except OSError:
+            pass
+    fp["packs"] = _fp_names(packs)
+    fp["dirs"] = _fp_names(
+        d for d in dirs if d.name.lower() in FP_INTERESTING_DIRS)
+    return {k: v for k, v in fp.items() if v}
+
+
+def fingerprint_match(fp: dict, path: Path) -> tuple[str, str]:
+    """拿包里记的指纹比对某个目录，返回 ``(结论, 人话说明)``。
+
+    结论取值：``match`` / ``partial`` / ``mismatch`` / ``unknown``。
+
+    ⚠️ 只用来**提示**，绝不阻止安装 —— 同一个游戏换个渠道下载，exe 名和
+    目录名都可能不一样，不能因为名字对不上就把用户挡在门外。
+    """
+    if not fp:
+        return "unknown", "翻译包里没记游戏特征（老版本导出的包）"
+    cur = game_fingerprint(path)
+    if not cur:
+        return "unknown", "这个目录读不出特征"
+
+    checks: list[tuple[str, bool]] = []
+    if fp.get("exe") and cur.get("exe"):
+        checks.append(("可执行文件", _fp_overlap(fp["exe"], cur["exe"])))
+    if fp.get("data_dirs") and cur.get("data_dirs"):
+        checks.append(("_Data 目录",
+                       _fp_overlap(fp["data_dirs"], cur["data_dirs"])))
+    if fp.get("packs") and cur.get("packs"):
+        checks.append(("资源封包", _fp_overlap(fp["packs"], cur["packs"])))
+    if fp.get("dirs") and cur.get("dirs"):
+        checks.append(("目录结构", _fp_overlap(fp["dirs"], cur["dirs"])))
+    if not checks:
+        return "unknown", "两边没有可比对的特征"
+
+    hit = sum(1 for _, ok in checks if ok)
+    detail = "、".join(f"{n}{'✓' if ok else '✗'}" for n, ok in checks)
+    if hit == len(checks):
+        return "match", f"和翻译包完全吻合（{detail}）"
+    if hit == 0:
+        return "mismatch", f"和翻译包对不上（{detail}）"
+    return "partial", f"和翻译包部分吻合（{detail}）"
 
 
 def find_game_dir(start: Path, *, max_up: int = 3) -> Optional[Path]:
@@ -133,6 +306,12 @@ def make_extractor(engine: EngineType, decoded_dir: Path):
     if engine == EngineType.UNITY:
         from ..extractors.unity import UnityExtractor
         return UnityExtractor(decoded_dir)
+    if engine == EngineType.BUDDHA:
+        from ..extractors.buddha import BuddhaExtractor
+        return BuddhaExtractor(decoded_dir)
+    if engine == EngineType.PLAINTEXT:
+        from ..extractors.plaintext import PlainTextExtractor
+        return PlainTextExtractor(decoded_dir)
     raise ValueError(f"暂不支持该引擎：{engine}")
 
 

@@ -25,6 +25,12 @@ def get_extractor(engine: EngineType, decoded_dir: Path):
     if engine == EngineType.UNITY:
         from .extractors.unity import UnityExtractor
         return UnityExtractor(decoded_dir)
+    if engine == EngineType.BUDDHA:
+        from .extractors.buddha import BuddhaExtractor
+        return BuddhaExtractor(decoded_dir)
+    if engine == EngineType.PLAINTEXT:
+        from .extractors.plaintext import PlainTextExtractor
+        return PlainTextExtractor(decoded_dir)
     raise ValueError(f"暂不支持该引擎的提取: {engine}")
 
 

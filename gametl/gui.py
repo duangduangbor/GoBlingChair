@@ -83,8 +83,53 @@ SASH_RETRY_MAX = 30
 
 APP_NAME = "滚刀哥布林汉化椅"
 APP_NAME_EN = "GoBlingChair"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.4.0"
 INSTALLER_NAME = "汉化安装器.exe"
+
+
+def safe_work_name(game_dir) -> str:
+    """游戏目录名 → 可作文件夹名的工程名。"""
+    name = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", Path(game_dir).name)
+    if name in (".", ".."):     # 会用成路径穿越，绝不能原样落盘
+        name = "game"
+    return (name or "game")[:60]
+
+
+def work_root_path(app_home, game_dir) -> Path:
+    """中间产物目录（**纯计算，不碰磁盘**）。
+
+    实测：46MB 的工程文件每落一次盘，机械盘要 5~7 秒，能把翻译吞吐从
+    22.7 条/秒砸到 11 条/秒。所以默认落在**软件所在的盘**。
+    """
+    return Path(app_home) / "data" / "work" / safe_work_name(game_dir)
+
+
+def project_path_candidates(app_home, game_dir) -> list:
+    """project.json 的候选位置，**新版在前、旧版在后**。
+
+    1. `<软件目录>/data/work/<游戏名>/project.json` —— v1.3 起的位置
+    2. `<游戏目录>/_汉化输出/project.json` —— v1.2 的老位置（软件盘不可写时
+       也会退回这里，见 `_work_root_for`）
+    """
+    g = Path(game_dir)
+    return [work_root_path(app_home, g) / "project.json",
+            g / "_汉化输出" / "project.json"]
+
+
+def resolve_project_path(app_home, game_dir):
+    """工程文件 project.json 到底在哪；都没有则返回 None。
+
+    ⚠️ **不要再手写指向 `_汉化输出` 的工程文件路径**。
+    从 v1.3 起工程文件搬到了 `<软件目录>/data/work/<游戏名>/`，
+    `_汉化输出/` 里根本没有 project.json —— 曾经因此让「快速校对 / 深度校对 /
+    重翻可疑条目」三个功能全部误报「还没有翻译结果」。
+    凡是需要读回工程的地方，一律走这个函数。
+    """
+    for p in project_path_candidates(app_home, game_dir):
+        if p.exists():
+            return p
+    return None
+
 
 # LunaTranslator 运行时翻译（路线2整合）：候选安装路径（按顺序探测）。
 # 首选 = 汉化椅目录内的便携副本（一体化结构）；其余为外置安装位置的兜底。
@@ -141,6 +186,8 @@ ENGINE_NAMES = {
     "rpgmaker_mv": "RPG Maker MV / MZ",
     "renpy": "Ren'Py",
     "unity": "Unity",
+    "buddha": "Double Fine（Buddha / Moai）",
+    "plaintext": "通用明文文本",
     "unknown": "未识别（可能是已解包目录）",
 }
 
@@ -233,8 +280,17 @@ class App:
         self._sash_saved = self._load_sash()
         self._closing = False                 # 关窗后别再续 after 链
         self._pump_id = None
+
+        # 「一键汉化」：翻译包仓库 + 它自己的任务线程。
+        # 刻意不复用 self.worker —— 那条线程的主流程要模型，这条完全不要，
+        # 两者并发时各自独立互不干扰。
+        self.pkg_thread: threading.Thread | None = None
+        self._repo_pkgs: list = []
+
         self._setup_ui()
         self._pump_log()
+        # 扫描软件自带的翻译包。放到 after 里，别让磁盘 IO 挡住窗口首帧。
+        self.root.after(120, self._refresh_repo)
 
         # 界面回调里抛的异常必须先被「看见」。默认行为是写 stderr ——
         # 打包成窗口程序后没有控制台，异常就此人间蒸发，用户点了按钮
@@ -708,6 +764,84 @@ class App:
             font=("Microsoft YaHei UI", 8))
         self.pkg_hint.pack(fill="x", pady=(6, 0))
         wrap_to_parent(self.pkg_hint, inner4)
+
+        # ---- 卡片 4.5：一键汉化（用现成翻译包，免模型） ----
+        # 跟上面的「开始汉化」是**并列的两条路**：
+        #   开始汉化 = 用自己的模型把游戏翻出来（要模型、要等）
+        #   一键汉化 = 拿现成的 .gtpkg 直接写进游戏（零模型、几秒）
+        # 底层就是安装器在用的 patcher.apply_patch —— 就地覆盖 + 原版备份 + 可还原。
+        # 出口是「导出汉化补丁包」，入口是这里，一来一回就闭环了。
+        card45 = tk.Frame(col, bg=CARD, highlightbackground="#e5e7eb",
+                          highlightthickness=1)
+        card45.pack(fill="x", pady=(0, 8))
+        inner45 = tk.Frame(card45, bg=CARD)
+        inner45.pack(fill="x", padx=16, pady=12)
+
+        tk.Label(inner45, text="一键汉化（用现成翻译包，免模型）",
+                 bg=CARD, fg=MUTED,
+                 font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+
+        self.repo_hint = tk.Label(
+            inner45, text="", bg=CARD, fg=MUTED,
+            font=("Microsoft YaHei UI", 9), anchor="w", justify="left")
+        self.repo_hint.pack(fill="x", pady=(6, 0))
+        wrap_to_parent(self.repo_hint, inner45)
+
+        # Listbox 外面套一层 1px 边框：tk.Listbox 自己的 border 在
+        # Windows 上会画成凹陷的 3D 边，跟其它卡片不是一套观感。
+        lb_wrap = tk.Frame(inner45, bg="#e5e7eb")
+        lb_wrap.pack(fill="x", pady=(6, 0))
+        self.repo_list = tk.Listbox(
+            lb_wrap, height=4, activestyle="none", bd=0,
+            font=("Microsoft YaHei UI", 9), selectmode="browse",
+            highlightthickness=0, background="#ffffff", foreground=TEXT,
+            selectbackground="#dbeafe", selectforeground="#1e40af",
+            exportselection=False)
+        self.repo_list.pack(fill="x", padx=1, pady=1)
+        self.repo_list.bind("<<ListboxSelect>>",
+                            lambda e: self._refresh_repo_buttons())
+
+        r45a = tk.Frame(inner45, bg=CARD)
+        r45a.pack(fill="x", pady=(8, 0))
+        self.pkg_apply_btn = tk.Button(
+            r45a, text="✔ 汉化到所选游戏", command=self.apply_package_to_game,
+            bg="#dcfce7", fg="#166534", activebackground="#bbf7d0",
+            relief="flat", cursor="hand2",
+            font=("Microsoft YaHei UI", 10, "bold"), padx=14, pady=8,
+            state="disabled")
+        self.pkg_apply_btn.pack(side="left")
+        self.pkg_revert_btn = tk.Button(
+            r45a, text="↩ 还原原版", command=self.revert_game,
+            bg="#fee2e2", fg="#991b1b", activebackground="#fecaca",
+            relief="flat", cursor="hand2",
+            font=("Microsoft YaHei UI", 10), padx=14, pady=8,
+            state="disabled")
+        self.pkg_revert_btn.pack(side="left", padx=(6, 0))
+
+        r45b = tk.Frame(inner45, bg=CARD)
+        r45b.pack(fill="x", pady=(6, 0))
+        self.pkg_add_btn = tk.Button(
+            r45b, text="➕ 收进软件", command=self.add_package_to_software,
+            bg="#ede9fe", fg="#5b21b6", activebackground="#ddd6fe",
+            relief="flat", cursor="hand2",
+            font=("Microsoft YaHei UI", 10), padx=14, pady=8)
+        self.pkg_add_btn.pack(side="left")
+        self.pkg_open_btn = tk.Button(
+            r45b, text="📂 打开包目录", command=self.open_repo_dir,
+            bg=IDLE_BTN, fg=TEXT, activebackground=IDLE_BTN_HOVER,
+            relief="flat", cursor="hand2",
+            font=("Microsoft YaHei UI", 10), padx=14, pady=8)
+        self.pkg_open_btn.pack(side="left", padx=(6, 0))
+
+        self.repo_tip = tk.Label(
+            inner45,
+            text="把导出的 .gtpkg 丢进软件目录的 packages 文件夹（或点「收进软件」），\n"
+                 "以后选中游戏就能直接汉化 —— 不用再跑一遍模型翻译。\n"
+                 "安装时会自动备份原版，随时可以还原。",
+            bg=CARD, fg=MUTED, justify="left", anchor="w",
+            font=("Microsoft YaHei UI", 8))
+        self.repo_tip.pack(fill="x", pady=(6, 0))
+        wrap_to_parent(self.repo_tip, inner45)
 
         # ---- 卡片 5：运行时翻译（整合 LunaTranslator） ----
         card5 = tk.Frame(col, bg=CARD, highlightbackground="#e5e7eb",
@@ -1183,12 +1317,18 @@ class App:
         elif engine_value == "unity":
             # Unity 没有传统封包，文本在 *_Data/*.assets 里，内置解析器直接读写
             parts.append("游戏文本在 .assets 里（内置解析，无需解包）")
+        elif engine_value == "buddha":
+            parts.append("游戏文本在 Win/Packs 的 .~p 资源包里（内置解析，无需解包）")
+        elif engine_value == "plaintext":
+            parts.append("没识别出引擎特征，按明文文本目录处理")
         else:
             parts.append("未发现资源包（按明文目录处理）")
         self.detect_label.configure(text="  •  ".join(parts), fg=OK_GREEN)
         self._log(f"引擎：{engine_value}；资源包：{n} 个", "info")
         self._log(note, "info")
         self._refresh_project_state(state or {})
+        # 换了游戏 → 重新算「软件里的哪个翻译包配得上它」
+        self._refresh_repo(rescan=False)
         st = state or {}
         if st.get("exists"):
             self._log(f"发现已有工程文件：{st.get('path')}", "info")
@@ -1209,6 +1349,9 @@ class App:
             messagebox.showwarning(APP_NAME, "请先选择游戏文件夹")
             return
         if self.worker and self.worker.is_alive():
+            return
+        if self._pkg_busy():
+            messagebox.showinfo(APP_NAME, "翻译包任务还在跑，请等它结束。")
             return
 
         out_dir = self.game_dir / "_汉化输出"
@@ -1289,9 +1432,7 @@ class App:
 
     def _work_root_path(self, game_dir: Path) -> Path:
         """中间产物默认落哪（纯计算，不碰磁盘）。"""
-        name = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", game_dir.name)
-        name = (name or "game")[:60]
-        return self.app_home / "data" / "work" / name
+        return work_root_path(self.app_home, game_dir)
 
     def _work_root_for(self, game_dir: Path) -> Path:
         """中间产物（工程文件 / 增量日志 / 解包结果）放哪儿。
@@ -1314,12 +1455,33 @@ class App:
 
     def _find_project_files(self, game_dir: Path) -> list:
         """找出这个游戏可能存在的工程文件（新版位置 + 旧版位置）。"""
-        out = []
-        for p in (self._work_root_path(game_dir) / "project.json",
-                  game_dir / "_汉化输出" / "project.json"):
-            if p.exists():
-                out.append(p)
-        return out
+        return [p for p in project_path_candidates(self.app_home, game_dir)
+                if p.exists()]
+
+    @staticmethod
+    def _journal_of(proj_path) -> Path:
+        """工程文件旁边的增量日志（约定同名 .journal.jsonl）。"""
+        return Path(proj_path).with_name("project.journal.jsonl")
+
+    def _load_project(self, proj_path):
+        """读回工程 —— **必须连增量日志一起读**。
+
+        译文是先写日志、流程结束才并进工程文件的。只读 project.json 的话，
+        日志里的译文会被当成「没翻」，导致校对漏检、重翻清不掉。
+        """
+        j = self._journal_of(proj_path)
+        return Project.load(proj_path, journal=j if j.exists() else None)
+
+    def _drop_journal(self, proj_path) -> None:
+        """日志已并进工程文件后把它删掉。
+
+        不删的后果：下次启动时 `load(..., journal=)` 会把日志里的译文重新
+        盖回去 —— 刚在「重翻可疑条目」里清掉的译文会**自己长回来**。
+        """
+        try:
+            self._journal_of(proj_path).unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _read_project_state(self, game_dir: Path) -> dict:
         """快速判断「这个游戏上次翻到哪了」。**只读文件头**，不动全量解析。
@@ -2020,14 +2182,345 @@ class App:
         self._log(f"翻译包操作失败：{err}", "err")
         messagebox.showerror(APP_NAME, f"翻译包操作失败：\n{err}")
 
+    # ---------------- 一键汉化（用现成翻译包，免模型） ----------------
+    #
+    # 和上面那条「开始汉化」是两条并列的路：
+    #   开始汉化 → 调模型把游戏翻出来（要引擎、要等）
+    #   一键汉化 → 拿现成的 .gtpkg 直接写进游戏（零模型、几秒）
+    # 后者就是安装器（汉化安装器.exe）本来在做的事，只是把入口搬进了主界面。
+    # 包从哪来：软件目录的 packages/（或软件根目录），也就是「导出补丁包」
+    # 的落点 —— 导出 → 收进软件 → 直接汉化，闭环。
+
+    def _pkg_busy(self) -> bool:
+        t = getattr(self, "pkg_thread", None)
+        return bool(t is not None and t.is_alive())
+
+    def _scan_repo(self) -> list:
+        """扫软件自带的所有翻译包（原始数据，还没打匹配结论）。"""
+        from gametl.core.package import list_packages
+        try:
+            return list_packages(self.app_home)
+        except Exception as e:  # noqa: BLE001
+            self._log(f"扫描翻译包失败：{e}", "warn")
+            return []
+
+    @staticmethod
+    def _repo_line(r: dict) -> str:
+        if r.get("error"):
+            return f"⚠  {r.get('name') or '?'} —— 这个包读不出来"
+        from gametl.core.package import VERDICT_LABEL
+        game = r.get("game") or r.get("name") or "（未记录）"
+        n = r.get("units") or 0
+        lang = r.get("target_lang") or ""
+        return (f"{VERDICT_LABEL.get(r.get('verdict'), '？')}  {game}"
+                f"　·　{n} 条{(' · ' + lang) if lang else ''}")
+
+    def _repo_hint_text(self) -> str:
+        pkgs = self._repo_pkgs
+        if not pkgs:
+            return ("软件里还没有翻译包。想走这条路：先「开始汉化」翻一款游戏，"
+                    "再点\n「📦 导出汉化补丁包」，然后回来点「➕ 收进软件」。")
+        bad = sum(1 for r in pkgs if r.get("error"))
+        if not self.game_dir:
+            return (f"软件里存着 {len(pkgs)} 个翻译包。选好游戏文件夹后，"
+                    "这里会标出哪个能直接用。")
+        good = sum(1 for r in pkgs
+                   if not r.get("error") and r.get("verdict") == "match")
+        if good:
+            return (f"存着 {len(pkgs)} 个包，其中 {good} 个和这个游戏完全吻合，"
+                    "可以直接汉化。"
+                    + (f"（另有 {bad} 个读不出来）" if bad else ""))
+        return (f"存着 {len(pkgs)} 个包，但都不太像这个游戏。"
+                "确认没选错游戏的话，也可以手动点一个试试。")
+
+    def _refresh_repo(self, rescan: bool = True) -> None:
+        """重画「一键汉化」卡片。
+
+        rescan=True 重新扫盘（启动时、收包后）；
+        rescan=False 只按新选的游戏重排匹配结论（包没变，换个游戏而已）。
+        """
+        if not hasattr(self, "repo_list"):
+            return
+        from gametl.core.package import rank_packages
+        if rescan or not getattr(self, "_raw_pkgs", None):
+            self._raw_pkgs = self._scan_repo()
+        try:
+            self._repo_pkgs = rank_packages(self._raw_pkgs, self.game_dir)
+        except Exception:  # noqa: BLE001
+            self._repo_pkgs = list(self._raw_pkgs)
+
+        had = self._current_repo_index()
+        self.repo_list.delete(0, "end")
+        for r in self._repo_pkgs:
+            self.repo_list.insert("end", self._repo_line(r))
+
+        # 默认选中贴合度最高的那个（排序后就是第一个），免得用户还得自己挑
+        pick = had
+        if pick is None and self._repo_pkgs:
+            best = self._repo_pkgs[0]
+            if not best.get("error") and best.get("verdict") in ("match",
+                                                                 "partial"):
+                pick = 0
+        if pick is not None and 0 <= pick < len(self._repo_pkgs):
+            self.repo_list.selection_set(pick)
+            self.repo_list.see(pick)
+
+        self.repo_hint.configure(text=self._repo_hint_text(), fg=MUTED)
+        self._refresh_repo_buttons()
+
+    def _current_repo_index(self):
+        try:
+            sel = self.repo_list.curselection()
+        except (tk.TclError, AttributeError):
+            return None
+        return sel[0] if sel else None
+
+    def _selected_repo_pkg(self):
+        i = self._current_repo_index()
+        if i is None or not (0 <= i < len(self._repo_pkgs)):
+            return None
+        return self._repo_pkgs[i]
+
+    def _refresh_repo_buttons(self) -> None:
+        rec = self._selected_repo_pkg()
+        can_apply = bool(self.game_dir and rec and not rec.get("error"))
+        installed = False
+        if self.game_dir:
+            try:
+                from gametl.core.patcher import patch_status
+                installed = bool(patch_status(self.game_dir).get("installed"))
+            except Exception:  # noqa: BLE001
+                installed = False
+        busy = self._pkg_busy()
+        for btn, ok in ((self.pkg_apply_btn, can_apply and not busy),
+                        (self.pkg_revert_btn, installed and not busy)):
+            try:
+                btn.configure(state="normal" if ok else "disabled")
+            except tk.TclError:
+                pass
+
+    def _set_pkg_busy(self, busy: bool) -> None:
+        for name, on in (("pkg_add_btn", True), ("pkg_open_btn", True),
+                         ("start_btn", True)):
+            b = getattr(self, name, None)
+            if b is None:
+                continue
+            try:
+                b.configure(state="disabled" if busy else "normal")
+            except tk.TclError:
+                pass
+        if busy:
+            for name in ("pkg_apply_btn", "pkg_revert_btn"):
+                b = getattr(self, name, None)
+                if b is not None:
+                    try:
+                        b.configure(state="disabled")
+                    except tk.TclError:
+                        pass
+        else:
+            self._refresh_repo_buttons()
+
+    def _pkg_progress(self, cur: int, total: int, desc: str) -> None:
+        try:
+            if total:
+                self.progress.configure(value=max(0, min(100, cur * 100 // total)))
+            self.stage_var.set(desc or "处理中…")
+        except tk.TclError:
+            pass
+
+    def apply_package_to_game(self):
+        """把选中的翻译包**直接写进游戏**（免模型、可就地还原）。"""
+        if not self.game_dir:
+            messagebox.showwarning(APP_NAME, "请先选择游戏文件夹")
+            return
+        if self._pkg_busy():
+            messagebox.showinfo(APP_NAME, "翻译包任务还在跑，请等它结束。")
+            return
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo(APP_NAME, "当前有任务在跑，请等它结束或先取消。")
+            return
+        rec = self._selected_repo_pkg()
+        if rec is None:
+            messagebox.showwarning(APP_NAME, "请先在列表里选一个翻译包。")
+            return
+        if rec.get("error"):
+            messagebox.showerror(APP_NAME, f"这个包读不出来：\n{rec['error']}")
+            return
+
+        verdict = rec.get("verdict")
+        if verdict == "mismatch":
+            warn = ("\n\n⚠ 这个包和所选游戏的特征**对不上**。\n"
+                    "同一款游戏换个渠道下载也可能名字不同，但先确认没选错游戏。")
+        elif verdict in ("partial", "unknown"):
+            warn = "\n\n（这个包跟游戏的吻合程度仅供参考。）"
+        else:
+            warn = ""
+
+        if not messagebox.askyesno(
+                APP_NAME,
+                "准备把汉化写进游戏：\n\n"
+                f"  游戏：{self.game_dir.name}\n"
+                f"  翻译包：{rec.get('game') or rec['name']}\n"
+                f"  译文：{rec.get('units')} 条\n\n"
+                "会在游戏目录里**就地覆盖**含文字的文件，并自动备份原版，\n"
+                "随时可以点「↩ 还原原版」回到原样。\n"
+                "全程不需要模型、不需要联网。" + warn + "\n\n现在开始吗？"):
+            return
+
+        self._set_pkg_busy(True)
+        self.cancel_event.clear()
+        self.progress.configure(value=0)
+        self._log("═" * 50, "info")
+        self._log(f"一键汉化：{rec.get('game') or rec['name']} → {self.game_dir}",
+                  "ok")
+        self.pkg_thread = threading.Thread(
+            target=self._apply_pkg_worker, args=(Path(rec["path"]),),
+            daemon=True)
+        self.pkg_thread.start()
+
+    def _apply_pkg_worker(self, pkg: Path):
+        try:
+            from gametl.core import patcher
+            res = patcher.apply_patch(
+                self.game_dir, pkg,
+                on_log=lambda m: self.root.after(0, self._log, m, "info"),
+                on_progress=lambda c, n, d: self.root.after(
+                    0, self._pkg_progress, c, n, d),
+                cancel_event=self.cancel_event)
+            self.root.after(0, self._apply_pkg_done, res)
+        except Exception as e:  # noqa: BLE001
+            self.root.after(0, self._apply_pkg_fail, str(e))
+
+    def _apply_pkg_done(self, res: dict):
+        from gametl.core.patcher import BACKUP_DIRNAME
+        self._set_pkg_busy(False)
+        self.progress.configure(value=100)
+        self.stage_var.set("汉化已装好")
+        self._log("✅ 汉化已经写进游戏。", "ok")
+        self._log(f"   改动 {res.get('files')} 个文件 · 命中译文 "
+                  f"{res.get('filled')} 条（精确 {res.get('by_uid')}"
+                  f" + 原文兜底 {res.get('by_memory')}）", "ok")
+        self._log(f"   与游戏文本的匹配率 "
+                  f"{(res.get('ratio') or 0) * 100:.1f}%"
+                  f"（游戏内共 {res.get('total')} 条）", "info")
+        if res.get("made_backup"):
+            self._log(f"   原版已备份到游戏目录的「{BACKUP_DIRNAME}」", "info")
+        if res.get("missed"):
+            self._log(f"   有 {res['missed']} 条没匹配上（多半是版本差异，"
+                      "游戏里会显示原文）", "warn")
+        messagebox.showinfo(
+            APP_NAME,
+            "汉化装好了。\n\n"
+            f"改动 {res.get('files')} 个文件，命中译文 {res.get('filled')} 条。\n"
+            f"原版已备份在游戏目录的「{BACKUP_DIRNAME}」里。\n\n"
+            "现在直接启动游戏就是中文了。\n"
+            "想换回原来的语言，点一下「↩ 还原原版」。")
+        self._refresh_repo(rescan=False)
+
+    def _apply_pkg_fail(self, err: str):
+        self._set_pkg_busy(False)
+        self.progress.configure(value=0)
+        self.stage_var.set("汉化失败")
+        self._log(f"一键汉化失败：{err}", "err")
+        messagebox.showerror(APP_NAME, f"一键汉化失败：\n{err}")
+
+    def revert_game(self):
+        """把游戏还原成装汉化之前的样子。"""
+        if not self.game_dir:
+            messagebox.showwarning(APP_NAME, "请先选择游戏文件夹")
+            return
+        if self._pkg_busy():
+            messagebox.showinfo(APP_NAME, "翻译包任务还在跑，请等它结束。")
+            return
+        # 主流程也在写游戏目录的话，还原会和它抢文件 —— 一律排队
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo(APP_NAME, "当前有任务在跑，请等它结束或先取消。")
+            return
+        from gametl.core.patcher import BACKUP_DIRNAME
+        if not messagebox.askyesno(
+                APP_NAME,
+                "把游戏还原成安装汉化之前的样子？\n\n"
+                f"  游戏：{self.game_dir.name}\n\n"
+                f"会用「{BACKUP_DIRNAME}」里的原版副本覆盖回去。\n"
+                "备份会保留，方便你之后再装一次。"):
+            return
+        self._set_pkg_busy(True)
+        self.progress.configure(value=0)
+        self._log("═" * 50, "info")
+        self._log(f"还原原版：{self.game_dir}", "info")
+        self.pkg_thread = threading.Thread(target=self._revert_worker,
+                                           daemon=True)
+        self.pkg_thread.start()
+
+    def _revert_worker(self):
+        try:
+            from gametl.core import patcher
+            res = patcher.revert_patch(
+                self.game_dir,
+                on_log=lambda m: self.root.after(0, self._log, m, "info"),
+                on_progress=lambda c, n, d: self.root.after(
+                    0, self._pkg_progress, c, n, d))
+            self.root.after(0, self._revert_done, res)
+        except Exception as e:  # noqa: BLE001
+            self.root.after(0, self._apply_pkg_fail, str(e))
+
+    def _revert_done(self, res: dict):
+        self._set_pkg_busy(False)
+        self.progress.configure(value=0)
+        self.stage_var.set("已还原原版")
+        n = res.get("restored") or 0
+        self._log(f"✅ 已还原成原版（{n} 个文件）", "ok")
+        if res.get("missing"):
+            self._log(f"   {len(res['missing'])} 个文件没能还原："
+                      f"{'、'.join(map(str, res['missing'][:3]))}…", "warn")
+        messagebox.showinfo(APP_NAME, f"已经还原成原版了（{n} 个文件）。")
+        self._refresh_repo(rescan=False)
+
+    def add_package_to_software(self):
+        """把别处的 .gtpkg 收进软件自带的包目录。"""
+        path = filedialog.askopenfilename(
+            title="选择要收进软件的翻译包",
+            filetypes=[("翻译包", "*.gtpkg"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            from gametl.core.package import add_to_repo, read_manifest
+            man = read_manifest(Path(path))
+            dst = add_to_repo(self.app_home, Path(path))
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror(APP_NAME, f"收不进来：\n{e}")
+            return
+        self._log(f"已收进软件：{dst.name}", "ok")
+        self._log(f"   《{man.get('game') or '未记录'}》· "
+                  f"译文 {man.get('units_translated')} 条 · "
+                  f"引擎 {man.get('engine') or '未知'}", "info")
+        self._refresh_repo(rescan=True)
+        for i, r in enumerate(self._repo_pkgs):
+            if Path(r["path"]) == dst:
+                self.repo_list.selection_clear(0, "end")
+                self.repo_list.selection_set(i)
+                self.repo_list.see(i)
+                break
+        self._refresh_repo_buttons()
+
+    def open_repo_dir(self):
+        from gametl.core.package import repo_dir
+        d = repo_dir(self.app_home)
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self._log(f"建不了包目录：{e}", "warn")
+            return
+        self._open_path(d)
+
     # ---------------- 校对 ----------------
 
     def run_audit(self, deep: bool = False):
         if not self.game_dir:
             messagebox.showwarning(APP_NAME, "请先选择游戏文件夹")
             return
-        proj = self.game_dir / "_汉化输出" / "project.json"
-        if not proj.exists():
+        proj = resolve_project_path(self.app_home, self.game_dir)
+        if proj is None:
             messagebox.showwarning(
                 APP_NAME, "还没有翻译结果。\n\n请先完成一次汉化，再回头校对。")
             return
@@ -2056,7 +2549,7 @@ class App:
             from gametl.core.validate import audit_units
             from gametl.translators.glossary import Glossary
 
-            project = Project.load(proj_path)
+            project = self._load_project(proj_path)
             gl = Glossary.load(self._find_glossary())
             rep = audit_units(project.units, glossary=gl.mapping,
                               target_lang=self.target_lang)
@@ -2127,18 +2620,24 @@ class App:
 
     def _retranslate(self, uids):
         """清空可疑条目的译文，再跑一次流程 —— 其余条目会被自动复用。"""
-        proj = self.game_dir / "_汉化输出" / "project.json"
+        proj = resolve_project_path(self.app_home, self.game_dir)
+        if proj is None:
+            messagebox.showerror(
+                APP_NAME, "找不到工程文件，无法重翻。\n\n请先完成一次汉化。")
+            return
         try:
-            from gametl.core.models import Project
-
-            project = Project.load(proj)
+            project = self._load_project(proj)
             want = set(uids)
             n = 0
             for u in project.units:
                 if u.uid in want and u.translated:
                     u.translated = None
+                    u.extra.pop("unverified", None)
                     n += 1
             project.save(proj)
+            # 日志里的条目现在已全部并进工程文件；不删的话下次启动会把
+            # 刚清掉的译文重新盖回来，重翻就白做了。
+            self._drop_journal(proj)
             self._log(f"已清空 {n} 条译文，开始重翻（其余保留）", "warn")
         except Exception as e:  # noqa: BLE001
             messagebox.showerror(APP_NAME, f"准备重翻失败：\n\n{e}")
@@ -2297,6 +2796,46 @@ def _selfcheck():
     except Exception as e:  # noqa: BLE001
         rec(False, f"完成标记: {e}")
 
+    # ---- 工程文件在哪（v2.3.1 修：校对/重翻找不到工程）----
+    # 从 v1.3 起工程文件在 <软件目录>/data/work/<游戏名>/，不在 _汉化输出/。
+    # 曾经三个功能都手写 "_汉化输出/project.json"，于是全部误报「还没有翻译结果」。
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            app_home = td / "app"
+            game = td / "MyGame"
+            game.mkdir(parents=True)
+            legacy = game / "_汉化输出" / "project.json"
+
+            workp = work_root_path(app_home, game)
+            workp.mkdir(parents=True, exist_ok=True)
+            (workp / "project.json").write_text("{}", encoding="utf-8")
+            rec(resolve_project_path(app_home, game) == workp / "project.json",
+                "工程路径：新版位置（软件盘 data/work）能找到")
+            rec(resolve_project_path(app_home, game) != legacy,
+                "工程路径：不再误认 _汉化输出/project.json")
+
+            (workp / "project.json").unlink()
+            legacy.parent.mkdir(parents=True, exist_ok=True)
+            legacy.write_text("{}", encoding="utf-8")
+            rec(resolve_project_path(app_home, game) == legacy,
+                "工程路径：旧版 _汉化输出 仍能兜底")
+
+            legacy.unlink()
+            rec(resolve_project_path(app_home, game) is None,
+                "工程路径：都没有时返回 None")
+
+            rec(work_root_path(app_home, game) ==
+                app_home / "data" / "work" / game.name,
+                "工程路径：与管线 work_root 同一套命名规则")
+            rec(App._journal_of(workp / "project.json").name ==
+                "project.journal.jsonl",
+                "工程路径：增量日志按同名解析")
+            rec(App._journal_of(workp / "project.json").parent == workp,
+                "工程路径：增量日志与工程文件同目录")
+    except Exception as e:  # noqa: BLE001
+        rec(False, f"工程路径: {e}")
+
     # ---- 引擎模型实况 ----
     try:
         from gametl.runtime_manager import RuntimeManager as _RM
@@ -2419,6 +2958,45 @@ def _selfcheck():
                 rec(True, "损坏的翻译包被正确拒绝")
     except Exception as e:  # noqa: BLE001
         rec(False, f"翻译包: {e}")
+
+    # ---- 一键汉化：翻译包仓库（软件自带 packages/） ----
+    try:
+        import tempfile as _tf3
+        from gametl.core import patcher as _pt3
+        from gametl.core.models import EngineType as _ET3
+        from gametl.core.models import Project as _P3
+        from gametl.core.models import TextUnit as _TU3
+        from gametl.core.package import (
+            REPO_DIRNAME, add_to_repo, export_package as _ep3,
+            list_packages, rank_packages, repo_dir)
+        rec(REPO_DIRNAME == "packages", "包仓库目录名 = packages")
+        rec(callable(add_to_repo) and callable(list_packages),
+            "包仓库「收入 / 扫描」接口齐备")
+        rec(callable(_pt3.apply_patch) and callable(_pt3.revert_patch),
+            "「直接汉化游戏 / 还原原版」底层接口齐备")
+        with _tf3.TemporaryDirectory() as _td3:
+            _home3 = Path(_td3) / "app"
+            _home3.mkdir()
+            rec(repo_dir(_home3) == _home3 / "packages",
+                "仓库路径 = <软件目录>/packages")
+            rec(list_packages(_home3) == [], "还没有包时扫描返回空列表")
+            _src3 = Path(_td3) / "x.gtpkg"
+            _u3 = _TU3("u1", "www/data/Map001.json", {"index": 1}, "テスト")
+            _u3.translated = "测试"
+            _ep3(_P3(Path("."), _ET3.RPGMAKER_MV, [_u3]), _src3)
+            _dst3 = add_to_repo(_home3, _src3)
+            rec(_dst3.is_file() and _dst3.parent == repo_dir(_home3),
+                "能把翻译包收进软件自带目录")
+            _lst3 = list_packages(_home3)
+            rec(len(_lst3) == 1 and _lst3[0]["units"] == 1,
+                "收进来的包能被扫到（含译文条数）")
+            rec(rank_packages(_lst3, None)[0]["verdict"] == "unknown",
+                "没选游戏时匹配结论为 unknown")
+            (_home3 / "bad.gtpkg").write_bytes(b"nope")
+            rec(any(r.get("error") for r in list_packages(_home3)),
+                "坏包留在列表里并带 error（不会被静默忽略）")
+    except Exception as e:  # noqa: BLE001
+        rec(False, f"包仓库: {e}")
 
     # ---- 增量导出 ----
     try:
@@ -2606,6 +3184,8 @@ def _selfcheck():
         ("gametl.core.detect", "引擎识别"),
         ("gametl.core.scan", "有界扫描"),
         ("gametl.core.validate", "两层校验"),
+        ("gametl.core.dfpf", "dfpf 包读写"),
+        ("gametl.core.patcher", "安装器核心（根目录识别/指纹）"),
         ("gametl.profiles", "性能档位"),
         ("gametl.runtime_manager", "便携运行时"),
         ("gametl.translators.ollama_backend", "翻译后端"),
@@ -2622,7 +3202,9 @@ def _selfcheck():
         from gametl.extractors.kirikiri import KiriKiriExtractor      # noqa: F401
         from gametl.extractors.renpy import RenPyExtractor            # noqa: F401
         from gametl.extractors.rpgmaker import RPGMakerExtractor      # noqa: F401
-        rec(True, "导入三个提取器")
+        from gametl.extractors.buddha import BuddhaExtractor          # noqa: F401
+        from gametl.extractors.plaintext import PlainTextExtractor    # noqa: F401
+        rec(True, "导入五个提取器（含 Buddha / 明文）")
     except Exception as e:  # noqa: BLE001
         rec(False, f"导入提取器: {e}")
 
@@ -2734,6 +3316,12 @@ def _selfcheck():
 
     # 真机验证通道：给一个真实 Unity 游戏目录就顺手跑一遍提取 + 回填
     _sample = os.environ.get("GAMETL_UNITY_SAMPLE")
+    if _sample and not Path(_sample).is_dir():
+        # 样本被删/改名时报清楚一点 —— 否则会以「提取 0 条」的形式出现，
+        # 看起来像回填链路坏了，其实是环境问题。
+        rec(False, f"Unity 真机样本不存在：{_sample}"
+                   f"（环境问题，不是代码问题；请改 GAMETL_UNITY_SAMPLE）")
+        _sample = None
     if _sample:
         import shutil as _sh
         _td = tempfile.mkdtemp(prefix="gt_unity_sc_")
@@ -2744,19 +3332,57 @@ def _selfcheck():
             _ex = _UE2(Path(_sample))
             _units = _ex.extract()
             rec(len(_units) > 0, f"Unity 真机提取 {len(_units)} 条文本")
-            if _units:
-                _head = _units[:20]
+            # Yarn 的四种写法都是玩家可见文本，历史上每一种都曾被当结构
+            # 标记整行丢掉：`-> 正文`（选项/分句演出）、`[[正文|目标]]`
+            # （Yarn 1.x 快捷选项）、`=> 正文`（Yarn 3.x 行组）、以及
+            # **没有说话人前缀的裸台词**（`Empty Text #line:xx`）。
+            # 这里四种都盯住 —— 「提取总数」涨跌看不出来，分行计数才看得见。
+            _ch = [u for u in _units if u.location.get("yarn_choice")]
+            _bk = [u for u in _units if u.location.get("yarn_bracket")]
+            _gr = [u for u in _units if u.location.get("yarn_group")]
+            _bare = [u for u in _units
+                     if u.location.get("yarn") and not u.location.get("speaker")]
+            if _ch:
+                rec(True, f"Unity 真机提取到 {len(_ch)} 条 `->` 选项行")
+            if _bk:
+                rec(True, f"Unity 真机提取到 {len(_bk)} 条 `[[..|..]]` 选项行")
+            if _gr:
+                rec(True, f"Unity 真机提取到 {len(_gr)} 条 `=>` 行组")
+            if _bare:
+                rec(True, f"Unity 真机提取到 {len(_bare)} 条无说话人裸台词")
+            # 只取 TextAsset（form=unitypy）那批来验回填 —— 头 20 条可能是
+            # 同目录的散装明文文件，拿它们验不到 .assets 写回这条链路；
+            # 有 Yarn 选项行就优先拿它们验（正是刚修的那条路径）。
+            _tf = [u for u in _units if u.location.get("form") == "unitypy"]
+            _head = ([u for u in _tf
+                      if u.location.get("yarn_choice")
+                      or u.location.get("yarn_bracket")][:8]
+                     or _tf[:20])
+            rec(bool(_head), f"Unity 真机 TextAsset 条目 {len(_head)} 条可回填")
+            if _head:
                 for _u in _head:
-                    if _u.location.get("form") == "unitypy":
-                        _u.translated = "【自检】" + _u.original
+                    _u.translated = "【自检】" + _u.original
                 _proj = _P2(root=Path(_sample), engine=_ET2.UNITY, units=_head)
                 _stats = _ex.write_back(_proj, Path(_td))
                 rec(_stats.get("files_written", 0) > 0,
                     f"Unity 真机回填 {_stats.get('files_written')} 个文件"
                     f"（{_wr(_stats)} 处）")
                 _hit = 0
-                for _p in Path(_td).rglob("*.assets"):
-                    _env = _UP.load(str(_p))
+                # ⚠️ 不能只 glob `*.assets`。Unity 的 TextAsset 还可能装在
+                # AssetBundle 里（例如 Sable 的 `*_Data/data.unity3d`），
+                # 只认 `*.assets` 会把「明明写成功了」误判成 0 命中。
+                # 以回填自己报告的 changed 列表为准，读不到再退回后缀兜底。
+                _try = [Path(_td) / _r for _r in (_stats.get("changed") or [])]
+                _try = [p for p in _try if p.is_file()]
+                if not _try:
+                    _try = [p for p in Path(_td).rglob("*")
+                            if p.is_file()
+                            and p.suffix in (".assets", ".unity3d", ".bundle")]
+                for _p in _try:
+                    try:
+                        _env = _UP.load(str(_p))
+                    except Exception:  # noqa: BLE001
+                        continue
                     for _o in _env.objects:
                         if _o.type.name != "TextAsset":
                             continue
@@ -2764,12 +3390,165 @@ def _selfcheck():
                         if "【自检】" in bytes(_d.m_Script).decode(
                                 "utf-8", "ignore"):
                             _hit += 1
-                rec(_hit > 0, f"Unity 真机回填后重新解包命中 {_hit} 个资产")
+                rec(_hit > 0, f"Unity 真机回填后重新解包命中 {_hit} 个资产"
+                              f"（查了 {len(_try)} 个文件）")
         except Exception as e:  # noqa: BLE001
             rec(False, f"Unity 真机验证: {e}")
         finally:
             # UnityPy 会持有文件句柄，清理失败无所谓，别把它算进自检结果
             _sh.rmtree(_td, ignore_errors=True)
+
+    # ---- Buddha（dfpf 包）合成包往返 ----
+    try:
+        from gametl.core.dfpf import (
+            DfpfPack as _DP, build_synthetic_v5 as _b5, find_packs as _fp,
+        )
+        from gametl.extractors.buddha import BuddhaExtractor as _BE
+        from gametl.core.models import Project as _P3, EngineType as _ET3
+        _st = ('StringTable{LineCodeData={'
+               'K1=LineCodeData{Text="Hello";VolumeDB=0;Character=Text;SoundCue=;};'
+               'K2=LineCodeData{Text="Press /BUTTON_DPadUp/ now";'
+               'VolumeDB=0;Character=Text;SoundCue=;};'
+               'CMAP1TEXT=LineCodeData{Text="ABC";VolumeDB=0;Character=Text;'
+               'SoundCue=;};};}')
+        with tempfile.TemporaryDirectory(prefix="gt_dfpf_sc_") as _td:
+            _td = Path(_td)
+            _b5(_td / "S.~h", _td / "S.~p", [
+                ("stringtable/enus", _st.encode("utf-8"), 0, True),
+                ("data/blob", bytes(range(256)), 1, False),
+            ])
+            rec(len(_fp(_td)) == 1, "dfpf：合成包能被扫到")
+            _pk = _DP.open(_td / "S.~h")
+            rec(_pk.version == 5, f"dfpf：版本识别 = {_pk.version}")
+            _ex = _BE(_td)
+            _us = _ex.extract()
+            rec(len(_us) == 2, f"Buddha 合成提取 {len(_us)} 条（CMAP 已跳过）")
+            if _us:
+                _k2 = [u for u in _us if u.location.get("key") == "K2"]
+                rec(bool(_k2) and "/BUTTON_DPadUp/" in (_k2[0].protected or ""),
+                    "按键宏 /BUTTON_DPadUp/ 已保护")
+                for _u in _us:
+                    _u.translated = "【自检】" + _u.original
+                _out = _td / "out"
+                _s = _ex.write_back(
+                    _P3(root=_td, engine=_ET3.BUDDHA, units=_us), _out)
+                rec(sorted(_s.get("changed", [])) == ["S.~h", "S.~p"],
+                    f"Buddha 合成回填索引+数据（{_s.get('changed')}）")
+                _pk2 = _DP.open(_out / "S.~h")
+                _txt = _pk2.read(_pk2.find("stringtable/enus")).decode("utf-8")
+                rec("【自检】Hello" in _txt, "Buddha 合成回填：重新解包命中")
+                rec(_pk2.read(_pk2.find("data/blob")) == bytes(range(256)),
+                    "Buddha 合成回填：其它资源零误伤")
+    except Exception as e:  # noqa: BLE001
+        rec(False, f"Buddha 合成往返: {e}")
+
+    # 真机验证通道：给一个真实 Buddha 游戏目录就顺手跑一遍提取 + 回填
+    _bsample = os.environ.get("GAMETL_BUDDHA_SAMPLE")
+    if _bsample:
+        import shutil as _sh2
+        _btd = tempfile.mkdtemp(prefix="gt_buddha_sc_")
+        try:
+            from gametl.extractors.base import wb_replaced as _wr2
+            from gametl.extractors.buddha import BuddhaExtractor as _BE2
+            from gametl.core.dfpf import DfpfPack as _DP2
+            from gametl.core.models import Project as _P4, EngineType as _ET4
+            _bex = _BE2(Path(_bsample))
+            _bu = _bex.extract()
+            rec(len(_bu) > 0, f"Buddha 真机提取 {len(_bu)} 条文本")
+            if _bu:
+                _bhead = _bu[:200]
+                for _u in _bhead:
+                    _u.translated = "【自检】" + _u.original
+                _bproj = _P4(root=Path(_bsample), engine=_ET4.BUDDHA,
+                             units=_bhead)
+                _bs = _bex.write_back(_bproj, Path(_btd))
+                rec(_bs.get("files_written", 0) > 0,
+                    f"Buddha 真机回填 {_bs.get('files_written')} 个文件"
+                    f"（{_wr2(_bs)} 处）")
+                _bhit = 0
+                for _h in Path(_btd).rglob("*.~h"):
+                    try:
+                        _pp = _DP2.open(_h)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for _e in _pp.entries:
+                        if "stringtable" not in _e.name.lower():
+                            continue
+                        try:
+                            _t = _pp.read(_e).decode("utf-8", "ignore")
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if "【自检】" in _t:
+                            _bhit += 1
+                rec(_bhit > 0, f"Buddha 真机回填后重新解包命中 {_bhit} 张表")
+        except Exception as e:  # noqa: BLE001
+            rec(False, f"Buddha 真机验证: {e}")
+        finally:
+            _sh2.rmtree(_btd, ignore_errors=True)
+
+    # 真机验证通道：给一个真实明文文本目录就顺手跑一遍提取 + 回填
+    _psample = os.environ.get("GAMETL_PLAINTEXT_SAMPLE")
+    if _psample:
+        import shutil as _sh3
+        _ptd = tempfile.mkdtemp(prefix="gt_plain_sc_")
+        try:
+            from gametl.extractors.plaintext import PlainTextExtractor as _PE
+            from gametl.core.models import Project as _P5, EngineType as _ET5
+            _pex = _PE(Path(_psample))
+            _pu = _pex.extract()
+            rec(len(_pu) > 0, f"明文真机提取 {len(_pu)} 条文本")
+            if _pu:
+                _phead = _pu[:100]
+                for _u in _phead:
+                    _u.translated = "【自检】" + _u.original
+                _pproj = _P5(root=Path(_psample), engine=_ET5.PLAINTEXT,
+                             units=_phead)
+                _ps = _pex.write_back(_pproj, Path(_ptd))
+                rec(_ps.get("files_written", 0) > 0,
+                    f"明文真机回填 {_ps.get('files_written')} 个文件")
+        except Exception as e:  # noqa: BLE001
+            rec(False, f"明文真机验证: {e}")
+        finally:
+            _sh3.rmtree(_ptd, ignore_errors=True)
+
+    # ---- 游戏根目录识别 + 翻译包指纹（安装器「自检根目录」的依据）----
+    # 全是合成目录，不依赖任何外部样本：造出各引擎的目录特征，看安装器
+    # 认不认；再造两个不同的游戏看指纹能不能把它们区分开。
+    try:
+        import shutil as _sh4
+        from gametl.core.patcher import (
+            looks_like_game as _llg, game_fingerprint as _gfp,
+            fingerprint_match as _fpm)
+        _rt = Path(tempfile.mkdtemp(prefix="gt_root_sc_"))
+        try:
+            # (a) Unity：`Xxx.exe` + `Xxx_Data/`
+            _u1 = _rt / "UnityGame"
+            (_u1 / "UnityGame_Data").mkdir(parents=True)
+            (_u1 / "UnityGame.exe").write_bytes(b"MZ")
+            rec(_llg(_u1), "Unity 目录被认成游戏根目录")
+            # (b) Buddha：封包在 Win/Packs 子目录里（CQ2 就是这种）
+            _u2 = _rt / "DfGame"
+            (_u2 / "Win" / "Packs").mkdir(parents=True)
+            (_u2 / "DfGame.exe").write_bytes(b"MZ")
+            (_u2 / "Win" / "Packs" / "Stuff.~h").write_bytes(b"dfpf")
+            (_u2 / "Win" / "Packs" / "Stuff.~p").write_bytes(b"xx")
+            rec(_llg(_u2), "子目录里成对的 .~h/.~p 被认成游戏根目录")
+            # (c) 空目录不能被认成游戏（否则「向上找」会随便停在某个目录）
+            _u3 = _rt / "Empty"
+            _u3.mkdir()
+            rec(not _llg(_u3), "空目录不被认成游戏")
+            # (d) 指纹：自己比自己 = match，别的游戏 = mismatch，老包 = unknown
+            _fp1 = _gfp(_u1)
+            rec(_fpm(_fp1, _u1)[0] == "match", "指纹自比判为 match")
+            _u4 = _rt / "Other"
+            (_u4 / "Other_Data").mkdir(parents=True)
+            (_u4 / "Other.exe").write_bytes(b"MZ")
+            rec(_fpm(_fp1, _u4)[0] == "mismatch", "指纹比对另一个游戏判为 mismatch")
+            rec(_fpm({}, _u1)[0] == "unknown", "没指纹的老包判为 unknown")
+        finally:
+            _sh4.rmtree(_rt, ignore_errors=True)
+    except Exception as e:  # noqa: BLE001
+        rec(False, f"根目录识别 + 指纹自检: {e}")
 
     lines.append("=== 自检完成 ===")
     try:
