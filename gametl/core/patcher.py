@@ -35,6 +35,7 @@ from .archive import detect_archives, repack, unpack_all
 from .detect import detect_engine
 from .models import EngineType, Project
 from .package import import_into, load_package, read_manifest
+from ..extractors.base import wb_replaced
 
 BACKUP_DIRNAME = "_汉化备份_原版"
 MANIFEST_NAME = "gametl_restore.json"
@@ -283,7 +284,7 @@ def apply_patch(game_dir: Path, package: Path, *,
         stats = extractor.write_back(project, wb)
         changed = list(stats.get("changed") or [])
         _log(on_log, f"回填：{stats.get('files_written', 0)} 个文件有变化"
-                     f"（{stats.get('fields_replaced', 0)} 处译文）")
+                     f"（{wb_replaced(stats)} 处译文）")
         ck()
 
         # ---- 备份原版（只建一次，之后永不覆盖） ----

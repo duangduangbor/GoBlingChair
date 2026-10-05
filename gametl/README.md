@@ -1,7 +1,7 @@
 # gametl —— 本地游戏文本汉化工具链
 
 用**本地大模型**（Ollama）驱动的游戏文本汉化流水线。不依赖任何在线翻译服务，
-数据不出本机。支持 KiriKiri、RPG Maker MV/MZ、Ren'Py、Unity（文本资源）四类引擎。
+数据不出本机。支持 KiriKiri、RPG Maker MV/MZ、Ren'Py、Unity 四类引擎。
 
 > **法律提示**：本工具仅用于处理你**合法拥有**的游戏。逆向、修改、分发商业游戏的
 > 汉化补丁涉及版权问题，请自行确认合规性后再使用。
@@ -152,16 +152,60 @@ python -m gametl writeback p.json -o translated/
 
 ### Unity
 
-**两种路线**：
+Unity 把资源打包在 `*_Data/*.assets`（SerializedFile）里，游戏对话绝大多数
+是其中的 **TextAsset**。本工具用 [UnityPy](https://github.com/K0lb3/UnityPy)
+解包并**把译文写回**，产出真正汉化过的 `.assets`（不是只读不改）。
 
-- **A. 文本资源路线（本工具支持）**：若游戏把文本放在 `.txt/.json/.csv` 里，
-  直接提取。`.assets` 中的 TextAsset 需安装 `UnityPy`：
-  `env -u PYTHONPATH <venv>/Scripts/python.exe -m pip install UnityPy`
-- **B. 运行时路线（推荐用于复杂 Unity 游戏）**：
-  用 [XUnity.AutoTranslator](https://github.com/bbepis/XUnity.AutoTranslator)
-  + BepInEx，游戏运行时抓取文本并实时翻译，**不改动游戏文件**，最稳。
-  可将其翻译后端指向本地 Ollama（配置见 XUnity 的 `AutoTranslatorConfig.ini`：
-  `Endpoint=OllamaTranslate`、`OllamaEndpoint=http://127.0.0.1:11434`）。
+```bash
+python -m gametl extract "E:/游戏/某Unity游戏" -o p.json
+python -m gametl translate p.json
+python -m gametl writeback p.json -o translated/
+# translated/ 里是改好的 *_Data/*.assets，覆盖回去即可
+```
+
+覆盖的两种主流文本形态（自动识别，无需配置）：
+
+| 形态 | 长相 | 处理方式 |
+|---|---|---|
+| **Yarn Spinner 对话脚本** | `Mae: 台词 #line:1519db` | 只替换冒号后的台词，说话人前缀与 `#line` 标签原样保留 |
+| **CSV 文本表**（`*_lines`） | `line:a91c46,Mae: 台词,注释` | 只替换台词列，line code / 说话人 / 注释不动 |
+
+会自动跳过不该翻的东西：开源许可证文件、吉他和弦谱面数据
+（`00.000|8|0` 这类时间戳行）、版本号、FMOD 事件清单。
+
+**依赖**：`UnityPy`（**必须用 1.10.x**，1.25+ 需要 Python 3.9+，本项目跑在 3.8）。
+打包版已内置，无需用户安装。
+
+**若游戏文本不在 TextAsset 里**（少数把对话写死在 C# 脚本或图片里），
+可以改走运行时方案：[XUnity.AutoTranslator](https://github.com/bbepis/XUnity.AutoTranslator)
++ BepInEx，运行时抓文本翻译，不改文件。
+
+> 实现细节：UnityPy 改完 `data.m_Script` 后**必须调 `data.save()`**
+> （它会 `set_raw_data` 更新原始字节），否则 `env.file.save()` 会原样吐回旧字节，
+> 表现为「日志说替换了 N 处，重新解包却一个字没变」。
+
+### 新增引擎的约定（写提取器之前先看）
+
+所有引擎共用同一条 extract → translate → writeback 管线，所以有两条硬约定：
+
+1. **位置信息要能唯一定位**：`source_file` 放相对路径，`location` 放行号 /
+   JSON 键路径 / CSV 行列等，回填阶段靠它精确落点。
+2. **`write_back()` 必须用 `base.wb_stats()` 构造返回值**，这四个键是下游契约：
+
+   | 键 | 含义 | 谁在用 |
+   |---|---|---|
+   | `files_written` | 实际落盘的文件数（内容没变不重写，保持 mtime 稳定） | 日志、增量导出 |
+   | `fields_replaced` | 替换掉的文本片段数 | 日志 |
+   | `unchanged` | 内容与原文件相同的文件数 | 日志 |
+   | `changed` | **要覆盖进游戏目录的文件清单** | 补丁安装器（`core/patcher.py`） |
+
+   配套工具：`write_back_file(src, dst, payload)` 一次返回
+   「是否落盘」与「是否与原文件不同」，直接用即可。
+
+> 历史坑（v2.1.0 修）：早期各引擎字段名各不相同（`lines_replaced` /
+> `segments_replaced`），主流程取 `fields_replaced` 直接 KeyError 崩掉；
+> 且 KiriKiri / Ren'Py / Unity 的 `changed` 一直是空的 ——「安装汉化补丁」
+> 会报告成功却一个文件都不写。读取端请统一用 `base.wb_replaced(stats)`。
 
 ---
 
@@ -180,7 +224,7 @@ gametl/
 │  ├─ kirikiri.py            # KiriKiri (.ks)
 │  ├─ rpgmaker.py            # RPG Maker MV/MZ (JSON)
 │  ├─ renpy.py               # Ren'Py (.rpy)
-│  └─ unity.py               # Unity（文本资源 + 可选 UnityPy）
+│  └─ unity.py               # Unity（UnityPy 解 .assets 的 TextAsset，改完写回）
 ├─ translators/
 │  ├─ glossary.py            # 术语表
 │  └─ ollama_backend.py      # Ollama 翻译后端

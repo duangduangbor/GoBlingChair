@@ -25,7 +25,7 @@ from pathlib import Path
 from ..core.models import Project, TextKind, TextUnit
 from ..core.protect import protect
 from ..core.scan import find_by_suffix
-from .base import BaseExtractor
+from .base import BaseExtractor, wb_stats, write_back_file
 
 # 匹配双引号字符串（支持转义）
 STRING_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
@@ -151,7 +151,9 @@ class RenPyExtractor(BaseExtractor):
                 by_file.setdefault(u.source_file, []).append(u)
 
         written = 0
+        unchanged = 0
         replaced = 0
+        changed: list[str] = []
         for rel, us in by_file.items():
             src = self.decoded_dir / rel
             if not src.exists():
@@ -178,10 +180,16 @@ class RenPyExtractor(BaseExtractor):
                 replaced += 1
 
             dst = Path(out_dir) / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_text("".join(lines), encoding="utf-8")
-            written += 1
-        return {"files_written": written, "lines_replaced": replaced}
+            payload = "".join(lines).encode("utf-8")
+            wrote, differs = write_back_file(src, dst, payload)
+            if wrote:
+                written += 1
+            if differs:
+                changed.append(rel)
+            else:
+                unchanged += 1
+        return wb_stats(files_written=written, replaced=replaced,
+                        unchanged=unchanged, changed=changed)
 
     @staticmethod
     def _replace_string(line: str, u: TextUnit, translated: str) -> str:

@@ -83,7 +83,7 @@ SASH_RETRY_MAX = 30
 
 APP_NAME = "滚刀哥布林汉化椅"
 APP_NAME_EN = "GoBlingChair"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.1.0"
 INSTALLER_NAME = "汉化安装器.exe"
 
 # LunaTranslator 运行时翻译（路线2整合）：候选安装路径（按顺序探测）。
@@ -2704,6 +2704,69 @@ def _selfcheck():
         rec(True, f"tkinter {tkinter.TkVersion}")
     except Exception as e:  # noqa: BLE001
         rec(False, f"tkinter: {e}")
+
+    # ---- Unity 引擎（.assets 里 TextAsset 的提取 + 回填）----
+    try:
+        import UnityPy as _UP
+        rec(True, f"UnityPy {getattr(_UP, '__version__', '?')}")
+        _pkg = Path(_UP.__file__).parent
+        rec((_pkg / "resources" / "uncompressed.tpk").is_file(),
+            "UnityPy 类型库 uncompressed.tpk 已随包")
+        for _m in ("lz4", "brotli", "etcpak", "texture2ddecoder", "tabulate",
+                   "fsspec", "PIL"):
+            try:
+                __import__(_m)
+                rec(True, f"UnityPy 依赖 {_m}")
+            except Exception as _me:  # noqa: BLE001
+                rec(False, f"UnityPy 依赖 {_m}: {_me}")
+        rec(callable(getattr(_UP, "load", None)), "UnityPy.load 可用")
+        from gametl.extractors.unity import UnityExtractor as _UE
+        rec(callable(getattr(_UE, "extract", None)), "Unity 提取器可用")
+        from gametl.extractors.base import wb_replaced as _wr, wb_stats as _ws
+        _st = _ws(files_written=1, replaced=2, changed=["a"])
+        rec(_wr(_st) == 2 and _wr({"lines_replaced": 3}) == 3,
+            "回填统计字段统一（兼容旧字段名）")
+    except Exception as e:  # noqa: BLE001
+        rec(False, f"UnityPy: {e}")
+
+    # 真机验证通道：给一个真实 Unity 游戏目录就顺手跑一遍提取 + 回填
+    _sample = os.environ.get("GAMETL_UNITY_SAMPLE")
+    if _sample:
+        import shutil as _sh
+        _td = tempfile.mkdtemp(prefix="gt_unity_sc_")
+        try:
+            from gametl.extractors.base import wb_replaced as _wr
+            from gametl.extractors.unity import UnityExtractor as _UE2
+            from gametl.core.models import Project as _P2, EngineType as _ET2
+            _ex = _UE2(Path(_sample))
+            _units = _ex.extract()
+            rec(len(_units) > 0, f"Unity 真机提取 {len(_units)} 条文本")
+            if _units:
+                _head = _units[:20]
+                for _u in _head:
+                    if _u.location.get("form") == "unitypy":
+                        _u.translated = "【自检】" + _u.original
+                _proj = _P2(root=Path(_sample), engine=_ET2.UNITY, units=_head)
+                _stats = _ex.write_back(_proj, Path(_td))
+                rec(_stats.get("files_written", 0) > 0,
+                    f"Unity 真机回填 {_stats.get('files_written')} 个文件"
+                    f"（{_wr(_stats)} 处）")
+                _hit = 0
+                for _p in Path(_td).rglob("*.assets"):
+                    _env = _UP.load(str(_p))
+                    for _o in _env.objects:
+                        if _o.type.name != "TextAsset":
+                            continue
+                        _d = _o.read()
+                        if "【自检】" in bytes(_d.m_Script).decode(
+                                "utf-8", "ignore"):
+                            _hit += 1
+                rec(_hit > 0, f"Unity 真机回填后重新解包命中 {_hit} 个资产")
+        except Exception as e:  # noqa: BLE001
+            rec(False, f"Unity 真机验证: {e}")
+        finally:
+            # UnityPy 会持有文件句柄，清理失败无所谓，别把它算进自检结果
+            _sh.rmtree(_td, ignore_errors=True)
 
     lines.append("=== 自检完成 ===")
     try:

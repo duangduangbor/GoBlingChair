@@ -29,6 +29,7 @@ from .core.archive import detect_archives, repack, unpack_all
 from .core.detect import detect_engine
 from .core.models import EngineType, Project
 from .core.validate import audit_units
+from .extractors.base import wb_replaced
 from .pipeline import get_extractor
 from .profiles import PROFILES, Profile
 from .translators.glossary import Glossary
@@ -665,8 +666,8 @@ class AutoPipeline:
             else:
                 self._stage(Stage.WRITEBACK, 0, 1, "回填译文...")
                 stats = extractor.write_back(project, translated_dir)
-                self._log(f"回填完成：写出 {stats['files_written']} 个文件"
-                          f"（{stats['fields_replaced']} 处译文，"
+                self._log(f"回填完成：写出 {stats.get('files_written', 0)} 个文件"
+                          f"（{wb_replaced(stats)} 处译文，"
                           f"{stats.get('unchanged', 0)} 个文件内容未变）")
                 self.result.written_back = stats.get("changed") or []
                 try:

@@ -24,6 +24,12 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("rpgmaker_ctrl", re.compile(r"\\[VNCIEX]{1,2}\[\d+\]")),
     # 美元符号变量 $gameVariables...
     ("dollar_var", re.compile(r"\$[A-Za-z_][\w\.\[\]]*")),
+    # Yarn Spinner 的 #line:xxxxxx 行注释标记（Unity 对话脚本）
+    ("yarn_line_tag", re.compile(r"#line:[0-9a-fA-F]+\b")),
+    # Yarn Spinner 的变量/逻辑标签 <<set $x>> <<if $x is 0>> 等
+    ("yarn_cmd", re.compile(r"<<[^>]*>>")),
+    # Yarn Spinner 的跳转/节点引用 [[NodeName]] 与 === 分隔
+    ("yarn_jump", re.compile(r"\[\[[^\]]+\]\]")),
 ]
 
 TOKEN_FMT = "\u3010{index}\u3011"  # 【0】【1】这种全角占位，模型很少改动

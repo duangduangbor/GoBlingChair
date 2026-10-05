@@ -31,7 +31,7 @@ from typing import Any
 
 from ..core.models import Project, TextKind, TextUnit
 from ..core.protect import protect
-from .base import BaseExtractor
+from .base import BaseExtractor, wb_stats
 
 # 指令码 -> 语义：401/405 是显示文字
 CODE_MESSAGE = 401
@@ -477,23 +477,31 @@ class RPGMakerExtractor(BaseExtractor):
             replaced += stats["replaced"]
             if stats["written"]:
                 written += 1
+            if stats.get("differs"):
                 changed.append(rel)
             else:
                 unchanged += 1
-        return {"files_written": written, "fields_replaced": replaced,
-                "unchanged": unchanged, "changed": changed}
+        return wb_stats(files_written=written, replaced=replaced,
+                        unchanged=unchanged, changed=changed)
 
-    def _put(self, dst: Path, payload: bytes, out_dir: Path,
-             rel: str) -> bool:
-        """内容相同就不落盘（保持 mtime 稳定）。返回是否真的写了。"""
+    def _put(self, src: Path, dst: Path, payload: bytes) -> tuple[bool, bool]:
+        """落盘一个回填产物，返回 (是否真的写了, 是否与原文件不同)。
+
+        第一个值用于保持 mtime 稳定（增量导出的前提）；第二个值用于告诉
+        补丁安装器「这个文件真的被汉化改动了，要覆盖进游戏目录」。
+        """
+        try:
+            differs = not src.is_file() or src.read_bytes() != payload
+        except OSError:
+            differs = True
         try:
             if dst.is_file() and dst.read_bytes() == payload:
-                return False
+                return False, differs
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(payload)
-            return True
+            return True, differs
         except OSError:
-            return False
+            return False, differs
 
     def _write_json(self, src: Path, out_dir: Path, rel: str,
                     us: list[TextUnit]) -> dict:
@@ -501,7 +509,7 @@ class RPGMakerExtractor(BaseExtractor):
         try:
             data = json.loads(src.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-            return {"written": 0, "replaced": 0}
+            return {"written": 0, "replaced": 0, "differs": False}
         n = 0
         for u in us:
             val = restore(u.translated, u.protected)
@@ -509,15 +517,16 @@ class RPGMakerExtractor(BaseExtractor):
                 n += 1
         payload = json.dumps(data, ensure_ascii=False, indent=None,
                              separators=(",", ":")).encode("utf-8")
-        wrote = self._put(Path(out_dir) / rel, payload, out_dir, rel)
-        return {"written": 1 if wrote else 0, "replaced": n}
+        wrote, differs = self._put(src, Path(out_dir) / rel, payload)
+        return {"written": 1 if wrote else 0, "replaced": n,
+                "differs": differs}
 
     def _write_plugins_js(self, src: Path, out_dir: Path, rel: str,
                           us: list[TextUnit]) -> dict:
         from ..core.protect import restore
         arr = self._read_plugins_js(src)
         if arr is None:
-            return {"written": 0, "replaced": 0}
+            return {"written": 0, "replaced": 0, "differs": False}
         by_plugin: dict[str, dict[str, list[TextUnit]]] = {}
         for u in us:
             by_plugin.setdefault(u.location.get("plugin", ""), {}) \
@@ -548,8 +557,9 @@ class RPGMakerExtractor(BaseExtractor):
         body = ",\n".join(json.dumps(o, ensure_ascii=False,
                                      separators=(",", ":")) for o in arr)
         payload = (header + body + "\n];\n").encode("utf-8")
-        wrote = self._put(Path(out_dir) / rel, payload, out_dir, rel)
-        return {"written": 1 if wrote else 0, "replaced": n}
+        wrote, differs = self._put(src, Path(out_dir) / rel, payload)
+        return {"written": 1 if wrote else 0, "replaced": n,
+                "differs": differs}
 
     def _apply_param(self, value: Any, items: list[TextUnit],
                      restore) -> tuple[Any, int]:
@@ -617,7 +627,7 @@ class RPGMakerExtractor(BaseExtractor):
         try:
             text = src.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
-            return {"written": 0, "replaced": 0}
+            return {"written": 0, "replaced": 0, "differs": False}
         spans = sorted(
             (u for u in us if u.location.get("js") == "src"),
             key=lambda u: u.location.get("off", 0), reverse=True)
@@ -632,8 +642,9 @@ class RPGMakerExtractor(BaseExtractor):
             text = text[:off] + restore(u.translated, u.protected) + text[off + ln:]
             n += 1
         payload = text.encode("utf-8")
-        wrote = self._put(Path(out_dir) / rel, payload, out_dir, rel)
-        return {"written": 1 if wrote else 0, "replaced": n}
+        wrote, differs = self._put(src, Path(out_dir) / rel, payload)
+        return {"written": 1 if wrote else 0, "replaced": n,
+                "differs": differs}
 
     @staticmethod
     def _set_value(data: Any, u: TextUnit, value: str) -> bool:

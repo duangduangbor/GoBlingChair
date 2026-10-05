@@ -21,7 +21,7 @@ from pathlib import Path
 from ..core.models import Project, TextKind, TextUnit
 from ..core.protect import protect
 from ..core.scan import find_by_suffix
-from .base import BaseExtractor
+from .base import BaseExtractor, wb_stats, write_back_file
 
 # KAG 行内变量引用：[pcname]、[name]、[f.xxx] —— 属于文本内容，应保留在文本中
 INLINE_VAR_RE = re.compile(r"\[[a-zA-Z_][\w\.]*\]")
@@ -194,7 +194,9 @@ class KiriKiriExtractor(BaseExtractor):
             by_file.setdefault(u.source_file, {})[int(ln)] = restore(u.translated, u.protected)
 
         written = 0
+        unchanged = 0
         replaced = 0
+        changed: list[str] = []
         for rel, line_map in by_file.items():
             src = self.decoded_dir / rel
             if not src.exists():
@@ -214,18 +216,24 @@ class KiriKiriExtractor(BaseExtractor):
                 replaced += 1
 
             dst = out_dir / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
             # 保持原编码写回
             out_text = "".join(lines)
             if enc.startswith("utf-16"):
-                dst.write_bytes(out_text.encode(enc))
+                payload = out_text.encode(enc)
             elif enc == "utf-8-sig":
-                dst.write_bytes(out_text.encode("utf-8-sig"))
+                payload = out_text.encode("utf-8-sig")
             else:
-                dst.write_bytes(out_text.encode(enc, errors="xmlcharrefreplace"))
-            written += 1
+                payload = out_text.encode(enc, errors="xmlcharrefreplace")
+            wrote, differs = write_back_file(src, dst, payload)
+            if wrote:
+                written += 1
+            if differs:
+                changed.append(rel)
+            else:
+                unchanged += 1
 
-        return {"files_written": written, "lines_replaced": replaced}
+        return wb_stats(files_written=written, replaced=replaced,
+                        unchanged=unchanged, changed=changed)
 
     @staticmethod
     def _rebuild_line(orig_line: str, translated: str) -> str:
