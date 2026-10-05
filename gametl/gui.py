@@ -1180,6 +1180,9 @@ class App:
         parts = [f"识别引擎：{name}"]
         if n:
             parts.append(f"发现 {n} 个资源包（将自动解包）")
+        elif engine_value == "unity":
+            # Unity 没有传统封包，文本在 *_Data/*.assets 里，内置解析器直接读写
+            parts.append("游戏文本在 .assets 里（内置解析，无需解包）")
         else:
             parts.append("未发现资源包（按明文目录处理）")
         self.detect_label.configure(text="  •  ".join(parts), fg=OK_GREEN)
