@@ -233,17 +233,20 @@ def game_fingerprint(path: Path) -> dict:
     return {k: v for k, v in fp.items() if v}
 
 
-def fingerprint_match(fp: dict, path: Path) -> tuple[str, str]:
+def fingerprint_match(fp: dict, path: Path, *,
+                      cur_fp: Optional[dict] = None) -> tuple[str, str]:
     """拿包里记的指纹比对某个目录，返回 ``(结论, 人话说明)``。
 
     结论取值：``match`` / ``partial`` / ``mismatch`` / ``unknown``。
 
     ⚠️ 只用来**提示**，绝不阻止安装 —— 同一个游戏换个渠道下载，exe 名和
     目录名都可能不一样，不能因为名字对不上就把用户挡在门外。
+
+    ``cur_fp``：该目录已采集好的指纹（批量比对时避免对同一个目录反复读盘）。
     """
     if not fp:
         return "unknown", "翻译包里没记游戏特征（老版本导出的包）"
-    cur = game_fingerprint(path)
+    cur = cur_fp if cur_fp is not None else game_fingerprint(path)
     if not cur:
         return "unknown", "这个目录读不出特征"
 

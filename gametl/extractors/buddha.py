@@ -328,36 +328,46 @@ class BuddhaExtractor(BaseExtractor):
             for u in units:
                 by_res.setdefault(u.location.get("resource", ""), []).append(u)
 
-            changes: dict[str, bytes] = {}
+            changes: dict = {}
             n_here = 0
             for res_name, rus in by_res.items():
-                ent = pack.find(res_name)
-                if ent is None or ent.comp == COMP_XMEM:
-                    continue
-                try:
-                    text = pack.read(ent).decode("utf-8")
-                except (DfpfPackError, OSError, UnicodeDecodeError):
-                    continue
-                entries = parse_entries(text)
-                index = {e["key"]: i for i, e in enumerate(entries)}
+                # ⚠ 同一个包里的资源名**可以重复**（CQ2 的 DLC1_Stuff 里
+                # stringtable/costumequestdlc1_leet 就有两条：一条未压缩的
+                # 短表 + 一条 zlib 的长表）。按名字取第一个会把译文写到错的
+                # 对象上，而真正那张表永远轮不到 —— 所以逐个候选"认领"：
+                # 谁的原文能和我们的 original 对上，谁就是目标。
+                for ent in pack.find_all(res_name):
+                    if ent.comp == COMP_XMEM:
+                        continue
+                    try:
+                        text = pack.read(ent).decode("utf-8")
+                    except (DfpfPackError, OSError, UnicodeDecodeError):
+                        continue
+                    entries = parse_entries(text)
+                    index = {e["key"]: i for i, e in enumerate(entries)}
 
-                new_values: dict[int, str] = {}
-                for u in rus:
-                    i = index.get(u.location.get("key", ""))
-                    if i is None:
+                    new_values: dict[int, str] = {}
+                    for u in rus:
+                        i = index.get(u.location.get("key", ""))
+                        if i is None:
+                            continue
+                        if entries[i]["value"] != u.original:
+                            # 原文对不上 = 这张表不是我们提取的那一张
+                            # （重名资源 / 版本不同），写了也是错的。
+                            continue
+                        raw_new = emit_value(restore(u.translated, u.protected),
+                                             entries[i]["raw"].startswith('"'))
+                        if raw_new == entries[i]["raw"]:
+                            continue
+                        new_values[i] = raw_new
+                    if not new_values:
                         continue
-                    raw_new = emit_value(restore(u.translated, u.protected),
-                                         entries[i]["raw"].startswith('"'))
-                    if raw_new == entries[i]["raw"]:
+                    new_text, n = rebuild(text, entries, new_values)
+                    if not n:
                         continue
-                    new_values[i] = raw_new
-                if not new_values:
-                    continue
-                new_text, n = rebuild(text, entries, new_values)
-                if not n:
-                    continue
-                changes[res_name] = new_text.encode("utf-8")
-                n_here += n
+                    changes[ent] = new_text.encode("utf-8")
+                    n_here += n
+                    break          # 这张表收工，同名的其余候选不用再看
 
             if not changes:
                 continue

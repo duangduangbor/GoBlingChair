@@ -98,6 +98,9 @@ class AutoConfig:
     import_package: Optional[Path] = None   # 导入 .gtpkg（免模型补全译文）
     import_memory: bool = True              # 导入时用「原文」兜底匹配
     export_package: Optional[Path] = None   # 流程结束顺手导出一份 .gtpkg
+    # --- 术语表（译名一致性，v2.5）---
+    auto_glossary: bool = False             # 术语表为空时，翻译前自动生成一份
+    glossary_save_path: Optional[Path] = None   # 生成后存哪（默认 glossary_path）
 
 
 @dataclass
@@ -533,6 +536,12 @@ class AutoPipeline:
 
                 if len(glossary):
                     self._log(f"载入术语表 {len(glossary)} 条")
+                elif cfg.auto_glossary:
+                    glossary = self._auto_build_glossary(
+                        project, translator, work_root, cfg)
+                else:
+                    self._log("未提供术语表 —— 专有名词的译法可能前后不一致"
+                              "（把「自动生成术语表」打开就能自动补上）")
 
                 todo = units if cfg.limit is None else units[:cfg.limit]
                 total = len(todo)
@@ -748,6 +757,46 @@ class AutoPipeline:
             self._log(f"[错误] {self.result.error}")
             self._log(traceback.format_exc())
             return self.result
+
+    def _auto_build_glossary(self, project, translator, work_root,
+                             cfg: AutoConfig) -> Glossary:
+        """术语表为空时自动造一份（一次性，通常几分钟）。
+
+        失败**绝不阻断翻译** —— 术语表是锦上添花，没有它照样能翻；
+        而且这一步依赖模型的「判断力」，小模型可能筛得不准。
+        """
+        from .translators.glossary_extract import build_glossary, save_glossary
+
+        self._log("术语表为空 —— 先扫一遍原文自动生成（提升专有名词一致性）...")
+        try:
+            gl = build_glossary(
+                project.units, translator, target_lang=cfg.target_lang,
+                on_progress=lambda c, n, d:
+                    self._stage(Stage.TRANSLATE, c, n, d),
+                on_log=self._log,
+                cancel_check=lambda: self.cancel_event.is_set())
+        except Cancelled:
+            raise
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[警告] 自动生成术语表失败，按无术语表继续：{e}")
+            return Glossary()
+
+        if not gl:
+            self._log("没筛出术语，按无术语表继续翻译")
+            return Glossary()
+
+        dest = (cfg.glossary_save_path or cfg.glossary_path
+                or (work_root / "glossary.json"))
+        try:
+            save_glossary(gl, dest)
+            self._log(f"术语表已生成并保存：{dest}（{len(gl)} 条）")
+        except OSError as e:  # noqa: BLE001
+            self._log(f"[警告] 术语表保存失败（不影响本次翻译）：{e}")
+        for k, v in list(gl.items())[:8]:
+            self._log(f"    {k} => {v}")
+        if len(gl) > 8:
+            self._log(f"    … 其余 {len(gl) - 8} 条见术语表文件（可手工编辑）")
+        return Glossary(gl)
 
     def _stage(self, stage: Stage, cur: int, total: int, desc: str) -> None:
         self.on_progress(stage.value, cur, total, desc)

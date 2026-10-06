@@ -109,6 +109,32 @@ def main() -> int:
             FAILED.append(f"缺少控件 {attr}")
     print("[OK] 关键控件齐全")
 
+    # ---- 术语表（v2.6.2）：改成全自动，界面上**不许**再有手工按钮 ----
+    if not hasattr(app, "gloss_hint"):
+        FAILED.append("缺少术语表说明控件 gloss_hint")
+    if hasattr(app, "gloss_btn"):
+        FAILED.append("术语表按钮应当删掉（已改为翻译前自动生成）")
+    if not hasattr(app, "build_glossary_clicked"):
+        FAILED.append("缺少 build_glossary_clicked 方法（留作内部能力）")
+    print("[OK] 术语表已改为全自动（无手工按钮）")
+
+    # ---- 游戏库页的进度反馈（v2.6.2）：用户在这一页点按钮，
+    #      就必须在这一页看到进度，不能只在「高级设置」里跑 ----
+    for attr in ("lib_stage", "lib_progress", "lib_status"):
+        if not hasattr(app, attr):
+            FAILED.append(f"缺少游戏库进度控件 {attr}")
+    try:
+        app._lib_task("测试中…", pct=42, kind="info")
+        if app.lib_stage.cget("text") != "测试中…":
+            FAILED.append("_lib_task 没把文案写到 lib_stage")
+        if int(float(app.lib_progress.cget("value"))) != 42:
+            FAILED.append("_lib_task 没把进度写到 lib_progress")
+        app._lib_progress_reset()
+    except Exception:
+        traceback.print_exc()
+        FAILED.append("_lib_task / _lib_progress_reset 抛异常")
+    print("[OK] 游戏库页有醒目进度行 + 进度条")
+
     # ---- 一键汉化（v2.4.0）：卡片、按钮、刷新逻辑 ----
     for attr in ("repo_list", "repo_hint", "pkg_apply_btn", "pkg_revert_btn",
                  "pkg_add_btn", "pkg_open_btn"):
@@ -133,6 +159,32 @@ def main() -> int:
         if str(getattr(app, attr).cget("state")) != "normal":
             FAILED.append(f"{attr} 应始终可用")
     print("[OK] 一键汉化按钮初始状态正确")
+
+    # ---- 游戏库（v2.6.0）：主界面默认页 ----
+    for attr in ("lib_tree", "lib_root_entry", "lib_scan_btn",
+                 "lib_choose_btn", "lib_apply_btn", "lib_revert_btn",
+                 "lib_open_btn", "lib_summary", "lib_status", "lib_progress",
+                 "lib_detail", "lib_rescan_btn", "nb"):
+        if not hasattr(app, attr):
+            FAILED.append(f"缺少游戏库控件 {attr}")
+    if not hasattr(app, "_lib_entries"):
+        FAILED.append("缺少 _lib_entries")
+    # 默认停在第 1 页（游戏库）—— 傻瓜式的前提
+    try:
+        if app.nb.index("current") != 0:
+            FAILED.append("默认页不是「游戏库」")
+        if "游戏库" not in str(app.nb.tab(0, "text")):
+            FAILED.append("第 1 页标题不是「游戏库」")
+        if len(app.nb.tabs()) < 2:
+            FAILED.append("应该有两个页签（游戏库 / 高级设置）")
+    except Exception:
+        traceback.print_exc()
+        FAILED.append("读 Notebook 页失败")
+    # 一个游戏都没选 → 三个操作按钮都该是禁用
+    for attr in ("lib_apply_btn", "lib_revert_btn", "lib_open_btn"):
+        if str(getattr(app, attr).cget("state")) != "disabled":
+            FAILED.append(f"没选游戏时 {attr} 应为禁用")
+    print("[OK] 游戏库控件齐全（默认页 = 游戏库）")
 
     app._set_profile(Profile.TURBO)
     app._set_model("auto")

@@ -6,6 +6,7 @@
   python -m gametl translate <project.json> [--model qwen2.5:7b] [--glossary terms.json] [--limit N]
   python -m gametl writeback <project.json> -o <输出目录>
   python -m gametl stats    <project.json>
+  python -m gametl glossary <project.json> -o glossary.json   # 自动生成术语表
   python -m gametl doctor           # 检查环境（Ollama/模型）
 """
 from __future__ import annotations
@@ -73,6 +74,37 @@ def cmd_stats(args) -> int:
     return 0
 
 
+def cmd_glossary(args) -> int:
+    """从工程自动生成术语表（统计召回 + 模型精筛）。"""
+    from gametl.translators.glossary_extract import (
+        build_glossary, save_glossary, can_refine)
+
+    proj = Project.load(Path(args.project))
+    print(f"工程载入：{len(proj.units)} 条原文")
+    t = OllamaTranslator(model=args.model, host=args.host)
+    if not t.health():
+        print(f"[错误] 无法连接翻译服务 {args.host}（请先 ollama serve）",
+              file=sys.stderr)
+        return 1
+    if not can_refine(t):
+        print("[警告] 当前是翻译专用模型，术语判定可能不准（建议用通用模型）")
+
+    gl = build_glossary(
+        proj.units, t, target_lang=args.target_lang,
+        on_log=lambda m: print(f"  {m}"),
+        on_progress=lambda c, n, d: print(f"  {d}"))
+    if not gl:
+        print("没有筛出可用的术语。")
+        return 0
+    save_glossary(gl, Path(args.output))
+    print(f"\n术语表已写入 {args.output}（{len(gl)} 条）")
+    for k, v in list(gl.items())[:30]:
+        print(f"  {k} => {v}")
+    if len(gl) > 30:
+        print(f"  … 其余 {len(gl) - 30} 条见文件")
+    return 0
+
+
 def cmd_doctor(args) -> int:
     print("=== 环境自检 ===")
     t = OllamaTranslator(host=args.host)
@@ -133,6 +165,15 @@ def build_parser() -> argparse.ArgumentParser:
     doc.add_argument("--host", default="http://127.0.0.1:11434")
     doc.add_argument("--model", default="qwen2.5:7b")
     doc.set_defaults(func=cmd_doctor)
+
+    gl = sub.add_parser("glossary",
+                        help="从工程自动生成术语表（提升译名一致性）")
+    gl.add_argument("project")
+    gl.add_argument("-o", "--output", default="glossary.json")
+    gl.add_argument("--model", default="qwen2.5:7b")
+    gl.add_argument("--host", default="http://127.0.0.1:11434")
+    gl.add_argument("--target-lang", default="简体中文", dest="target_lang")
+    gl.set_defaults(func=cmd_glossary)
 
     return p
 

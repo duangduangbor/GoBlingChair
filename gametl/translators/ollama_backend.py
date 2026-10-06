@@ -135,6 +135,15 @@ class TranslateOptions:
     max_retries: int = 3
     skip_useless: bool = True     # 是否预过滤无需翻译的条目
 
+    # --- 上下文一致性（v2.5）---
+    # 批量模式（默认）此前把提取器认出来的说话人/场景**直接丢掉**了：
+    # `_build_batch_prompt` 拿到 (idx, text, context) 三元组却只用 text。
+    # 打开后把说话人写进提示词，并给每批附上前 N 条的原文当「只读上文」——
+    # 让模型能消解代词与称呼（"它"/"那家伙"到底指谁）。
+    # 代价：每条请求多几十到几百 token（前缀会被 KV 缓存复用，实测吞吐几乎不变）。
+    inject_context: bool = True
+    context_overlap: int = 2      # 每批附带的前置原文条数（0 = 关闭上文）
+
 
 # ---------------------------------------------------------------- 预过滤
 
@@ -201,7 +210,7 @@ class OllamaTranslator:
         self.stats: dict[str, int] = {
             "skipped": 0, "unique": 0, "requests": 0,
             "batched": 0, "degraded": 0, "retried": 0, "failed": 0,
-            "batch_off": 0, "unverified": 0,
+            "batch_off": 0, "unverified": 0, "ctx": 0,
         }
 
     # ---------------- 基础 ----------------
@@ -234,6 +243,29 @@ class OllamaTranslator:
             headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             return json.loads(r.read())
+
+    def generate(self, prompt: str, system: str = "",
+                 format_json: bool = False, temperature: float = 0.1,
+                 num_predict: int = 1024) -> str:
+        """低层通用生成 —— 给「术语抽取」这类辅助任务复用。
+
+        与 ``translate_one`` 的区别：不做译文清理、不做硬校验，只把模型
+        原始输出交回调用方。术语筛选需要的是模型的**判断**，不是译文。
+        """
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "system": system,
+            "stream": False,
+            "keep_alive": self.opt.keep_alive,
+            "options": {"temperature": temperature, "top_p": 0.9,
+                        "num_predict": num_predict},
+        }
+        if format_json:
+            payload["format"] = "json"
+        data = self._post(payload)
+        self.stats["requests"] += 1
+        return (data.get("response") or "").strip()
 
     def _system(self) -> str:
         return SYSTEM_PROMPT_SLIM if self.opt.slim_prompt else SYSTEM_PROMPT
@@ -346,8 +378,14 @@ class OllamaTranslator:
     # ---------------- 批量 ----------------
 
     def _build_batch_prompt(self, items: list, glossary: Glossary,
-                            target_lang: str) -> str:
-        """items: [(idx, text, context)]"""
+                            target_lang: str,
+                            prior: Optional[list] = None) -> str:
+        """items: [(idx, text, context)]
+
+        ``prior`` 是本批之前的若干条原文（只读上文）。分块是按提取顺序切的，
+        所以一批基本是**同一段连续对话的前后几句** —— 把上文交给模型，
+        它才能消解代词与称呼（"它"/"那家伙"到底指谁）。
+        """
         if self.prompt_style == "hymt":
             head = HYMT_BATCH_PROMPT.format(target_lang=target_lang)
         else:
@@ -363,6 +401,25 @@ class OllamaTranslator:
             sep = "翻译成" if self.prompt_style == "hymt" else "=>"
             lines.append("术语表：" + "；".join(f"{k}{sep}{v}" for k, v in picked))
 
+        # ---- 上下文注入（v2.5）----
+        # 翻译专用模型（Hy-MT 等）走极简模板，多加结构反而干扰输出，跳过。
+        if self.opt.inject_context and self.prompt_style != "hymt":
+            cast = [(i, (c or {}).get("speaker")) for i, _t, c in items]
+            cast = [(i, s) for i, s in cast if s]
+            if cast:
+                lines.append(
+                    "本批是同一段连续对话。各条说话人（仅供把握语气与称呼，"
+                    "不要出现在译文里）："
+                    + "；".join(f"{i}={s}" for i, s in cast))
+            if prior:
+                ov = max(1, int(self.opt.context_overlap))
+                shown = prior[-ov:]
+                lines.append(
+                    f"上文（前 {len(shown)} 条，仅供理解衔接，"
+                    "不要翻译、不要出现在输出里）：")
+                for j, t in enumerate(shown, 1):
+                    lines.append(f"  [{j}] {t}")
+
         lines.append("")
         lines.append("输入：")
         lines.append(json.dumps({str(i): t for i, t, _c in items},
@@ -373,17 +430,20 @@ class OllamaTranslator:
 
     def translate_multi(self, items: list, glossary: Optional[Glossary] = None,
                         target_lang: str = "简体中文",
+                        prior: Optional[list] = None,
                         ) -> tuple[dict, Optional[str]]:
         """一次请求翻译多条。
 
         Args:
             items: [(idx, text, context)]
+            prior: 本批之前的若干条原文，作只读上文（见 ``_build_batch_prompt``）
 
         Returns:
             (结果字典 {idx: 译文}, 失败原因)。失败时结果为空，由调用方降级处理。
         """
         glossary = glossary or Glossary()
-        prompt = self._build_batch_prompt(items, glossary, target_lang)
+        prompt = self._build_batch_prompt(items, glossary, target_lang,
+                                          prior=prior)
         total_chars = sum(len(t) for _i, t, _c in items)
 
         payload = {
@@ -548,7 +608,15 @@ class OllamaTranslator:
         if bs > 1 and avg_len < opt.batch_min_len:
             self.stats["batch_off"] = 1
             bs = 1
-        chunks = [keys[i:i + bs] for i in range(0, len(keys), bs)]
+        # 每批附带前 N 条原文当「只读上文」（v2.5）。分块本身已按提取顺序切，
+        # 所以"上一批的尾部几条"就是天然的前文 —— 纯白捡的上下文。
+        ov = max(0, int(opt.context_overlap)) if opt.inject_context else 0
+        chunks: list = []
+        for _s in range(0, len(keys), bs):
+            _body = keys[_s:_s + bs]
+            # 单条批走 translate_one，没有 prior 参数，就不带了
+            _prior = keys[max(0, _s - ov):_s] if (ov and len(_body) > 1) else []
+            chunks.append((_prior, _body))
 
         # ---- 3. 并发执行 ----
         lock = threading.Lock()
@@ -590,16 +658,19 @@ class OllamaTranslator:
             except Exception:  # noqa: BLE001
                 pass
 
-        def work(chunk: list) -> None:
+        def work(prior: list, chunk: list) -> None:
             if cancelled():
                 return
             # --- 批量尝试 ---
             if len(chunk) > 1:
                 items = [(i, k, groups[k][0].context)
                          for i, k in enumerate(chunk, 1)]
-                res, err = self.translate_multi(items, glossary, target_lang)
+                res, err = self.translate_multi(items, glossary, target_lang,
+                                                prior=prior)
                 if not err:
                     self.stats["batched"] += 1
+                    if prior:
+                        self.stats["ctx"] += 1
                     for i, k in enumerate(chunk, 1):
                         store(k, res[i])
                     return
@@ -627,7 +698,7 @@ class OllamaTranslator:
         last_save = [0]
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = [ex.submit(work, c) for c in chunks]
+            futures = [ex.submit(work, c[0], c[1]) for c in chunks]
             for fut in as_completed(futures):
                 try:
                     fut.result()
@@ -662,6 +733,8 @@ class OllamaTranslator:
             parts.append(f"去重后 {s['unique']} 个唯一串")
         if s["batched"]:
             parts.append(f"批量请求 {s['batched']} 次")
+        if s.get("ctx"):
+            parts.append(f"其中带上下文 {s['ctx']} 批")
         if s["degraded"]:
             parts.append(f"降级逐条 {s['degraded']} 批")
         if s.get("batch_off"):

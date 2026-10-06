@@ -1,30 +1,28 @@
 # -*- coding: utf-8 -*-
 """滚刀哥布林汉化椅 —— 图形界面主程序。
 
-面向非技术用户：选文件夹 → 选档位 → 点开始 → 自动完成 → 想复核就点校对。
+**傻瓜式**：用户只需要回答一个问题 —— 游戏装在哪个盘 / 文件夹。
+软件自己扫、自己判断，把扫到的游戏列成一张表（游戏 / 状态 / 类型 / 位置），
+用户点一行、点一下「汉化这个游戏」就行。
+
+引擎、模型、性能档位、翻译包、术语表这些**内部概念全部收进「高级设置」页**，
+默认看不见 —— 不关心的人一辈子不用点进去。
 
 界面布局::
 
-    ┌──────────────────────────────────────────────────┐
-    │  滚刀哥布林汉化椅                                  │
-    │  ──────────────────────────────────────────────  │
-    │  🟢 翻译引擎就绪（端口 11435）· 模型 gametl-model  │
-    │  ┌── 游戏文件夹 ──────────────────────────────┐  │
-    │  │ [____________________] [选择文件夹]        │  │
-    │  │ 识别引擎：RPG Maker MV / MZ · 未发现资源包  │  │
-    │  └────────────────────────────────────────────┘  │
-    │  ┌── 性能档位 ────────────────────────────────┐  │
-    │  │ [🐢兼容] [🟢普通] [🔵强效] [🔴狂暴]         │  │
-    │  │ RTX 3060 Ti · 显存 8.0 GB → 推荐：强效      │  │
-    │  │ 并发 4 路 · 每批 8 条 · 预计占用 6.5 GB     │  │
-    │  └────────────────────────────────────────────┘  │
-    │  [▶ 开始汉化] [取消]  [校对] [深度校对] [输出]    │
-    │  正在翻译... 420/77401      12.3 条/秒 · 剩 1.7h │
-    │  [████████░░░░░░░░░░░░░░]  1%                    │
-    │  运行日志                                         │
-    │  ┌────────────────────────────────────────────┐  │
-    │  └────────────────────────────────────────────┘  │
-    └──────────────────────────────────────────────────┘
+    ┌────────────────────────────────────────────────────┐
+    │  🎮 滚刀哥布林汉化椅          🟢 翻译引擎就绪        │
+    │  ┌ 游戏库 ─┐┌ 高级设置 ─┐                            │
+    │  │ 游戏装在哪儿？[D:\\SteamLibrary\\...] [选择] [扫描] │
+    │  │ ┌────────┬────────┬────────┬────────────────┐    │
+    │  │ │ 游戏   │ 状态   │ 类型   │ 位置           │    │
+    │  │ │ CQ2    │ 已汉化 │ Unity  │ D:\\...         │    │
+    │  │ │ 星露谷 │ 可一键 │ RPG MV │ D:\\...         │    │
+    │  │ └────────┴────────┴────────┴────────────────┘    │
+    │  │ [▶ 汉化这个游戏] [↩ 还原] [📂 打开] [🔄 重扫]     │
+    │  │ 扫到 12 个游戏 · 3 个可一键汉化 · 2 个已汉化      │
+    │  └──────────────────────────────────────────────────┘
+    └────────────────────────────────────────────────────┘
 """
 from __future__ import annotations
 
@@ -59,6 +57,11 @@ from gametl.auto import (  # noqa: E402
 )
 from gametl.core.archive import detect_archives  # noqa: E402
 from gametl.core.detect import detect_engine  # noqa: E402
+# 游戏库（傻瓜式主界面）：扫盘 → 一张表 → 选中即一键
+from gametl.core.library import (  # noqa: E402
+    KIND_MUTED, KIND_OK, KIND_WARN, ST_PATCHED, GameEntry, common_roots,
+    describe_game, scan_games, summarize, summary_text,
+)
 from gametl.core.models import Project  # noqa: E402
 from gametl.core.scan import ScanStats  # noqa: E402
 from gametl.profiles import (  # noqa: E402
@@ -83,7 +86,7 @@ SASH_RETRY_MAX = 30
 
 APP_NAME = "滚刀哥布林汉化椅"
 APP_NAME_EN = "GoBlingChair"
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.6.2"
 INSTALLER_NAME = "汉化安装器.exe"
 
 
@@ -287,10 +290,23 @@ class App:
         self.pkg_thread: threading.Thread | None = None
         self._repo_pkgs: list = []
 
+        # 游戏库（v2.6.0）：傻瓜式主界面的状态。扫描、读状态都在独立线程，
+        # 绝不占主线程（用户可能一指就指到 4TB 机械盘）。
+        self._lib_entries: list = []
+        self._lib_thread: threading.Thread | None = None
+        self._lib_cancel = threading.Event()
+        self._lib_scanned_root: str = ""
+        self._lib_quick_roots: list = []
+        # 开机自动连扫：待试位置队列 + 是否处于「正在自动找」模式
+        self._lib_boot_queue: list = []
+        self._lib_boot_mode: bool = False
+
         self._setup_ui()
         self._pump_log()
         # 扫描软件自带的翻译包。放到 after 里，别让磁盘 IO 挡住窗口首帧。
         self.root.after(120, self._refresh_repo)
+        # 游戏库：探测常见位置，并自动扫一遍最可能的那个
+        self.root.after(260, self._lib_bootstrap)
 
         # 界面回调里抛的异常必须先被「看见」。默认行为是写 stderr ——
         # 打包成窗口程序后没有控制台，异常就此人间蒸发，用户点了按钮
@@ -508,7 +524,7 @@ class App:
         ttk.Label(tcol, text=f"{APP_NAME}",
                   style="Title.TLabel").pack(anchor="w")
         ttk.Label(tcol, text=f"{APP_NAME_EN}  ·  "
-                             "选择游戏文件夹，一键完成汉化补丁制作",
+                             "告诉我游戏装在哪儿，剩下的交给我",
                   style="Sub.TLabel").pack(anchor="w", pady=(2, 0))
 
         # 引擎状态放右上角：它只是一行提示，不该独占一整行把日志往下挤
@@ -548,11 +564,25 @@ class App:
             state="disabled")
         self.open_out_btn.pack(side="right")
 
-        # ---- 中间：左右分栏（左设置 / 右日志，可拖动） ----
+        # ---- 中间：Notebook（游戏库 = 主入口 / 高级设置 = 全部细节） ----
+        # 傻瓜式：默认停在「游戏库」，普通用户永远不用切到第二页。
+        nb = ttk.Notebook(r)
+        nb.pack(fill="both", expand=True, padx=18, pady=(10, 4))
+        self.nb = nb
+
+        lib_page = ttk.Frame(nb)
+        nb.add(lib_page, text="  🎮 游戏库  ")
+        adv_page = ttk.Frame(nb)
+        nb.add(adv_page, text="  ⚙ 高级设置  ")
+        self._lib_page = lib_page
+        self._adv_page = adv_page
+        self._build_library_page(lib_page)
+
+        # ---- 高级设置：原来的左右分栏（左设置 / 右日志，可拖动） ----
         # 两栏都给非 0 权重：这是「打开就只见日志、设置区得手动拖出来」
         # 的根治办法（见文件头 PANE_WEIGHT_LEFT 的注释）。
-        pane = ttk.PanedWindow(r, orient="horizontal")
-        pane.pack(fill="both", expand=True, padx=18, pady=(10, 4))
+        pane = ttk.PanedWindow(adv_page, orient="horizontal")
+        pane.pack(fill="both", expand=True)
         self._pane = pane
 
         lholder = ttk.Frame(pane)
@@ -703,6 +733,29 @@ class App:
         self.lang_hint.pack(fill="x", pady=(6, 0))
         wrap_to_parent(self.lang_hint, inner35)
         self._set_lang(self.target_lang)
+
+        # ---- 卡片 3.6：术语表（v2.6.2 起**全自动**，不再要用户点） ----
+        card36 = tk.Frame(col, bg=CARD, highlightbackground="#e5e7eb",
+                          highlightthickness=1)
+        card36.pack(fill="x", pady=(0, 8))
+        inner36 = tk.Frame(card36, bg=CARD)
+        inner36.pack(fill="x", padx=16, pady=12)
+
+        tk.Label(inner36, text="术语表（自动，无需操作）", bg=CARD,
+                 fg=MUTED,
+                 font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+
+        self.gloss_hint = tk.Label(
+            inner36,
+            text="软件会扫一遍全部原文，自动挑出人名 / 地名 / 技能 / 道具这类"
+                 "需要统一译法的词，生成一份译名对照表。\n"
+                 "生成后每次翻译都会自动带上它 —— 同一个词不会再"
+                 "「这里叫公会、那里叫行会」。\n"
+                 "这一步已经排在翻译流程里自动做，不需要你点任何按钮。",
+            bg=CARD, fg=MUTED, justify="left", anchor="w",
+            font=("Microsoft YaHei UI", 8))
+        self.gloss_hint.pack(fill="x", pady=(6, 0))
+        wrap_to_parent(self.gloss_hint, inner36)
 
         # ---- 卡片 4：校对与交付 ----
         card4 = tk.Frame(col, bg=CARD, highlightbackground="#e5e7eb",
@@ -914,8 +967,664 @@ class App:
                                                       self._place_sash), add="+")
         r.after(SASH_RETRY_MS, self._place_sash)
 
-        self._log("欢迎使用！先选游戏文件夹，再挑性能档位和翻译模型。", "info")
-        self._log("档位越高越快、越吃显存；模型决定速度与质量的取舍。", "info")
+        self._log("欢迎使用！在「游戏库」里指一个盘或文件夹，我来找游戏。", "info")
+        self._log("扫到游戏后选中它，点「▶ 汉化这个游戏」就行。", "info")
+
+    # ---------------- 游戏库（傻瓜式主界面） ----------------
+
+    def _build_library_page(self, parent) -> None:
+        """构建「游戏库」页：选位置 → 扫描 → 一张表 → 选中即一键。
+
+        这里是普通用户**唯一**需要面对的界面，所以刻意只有三样东西：
+        一个位置输入框、一张游戏表、一排按钮。引擎/模型/术语表一律不出现。
+        """
+        page = tk.Frame(parent, bg=BG)
+        page.pack(fill="both", expand=True, padx=12, pady=(10, 8))
+
+        # ---- ① 位置 ----
+        top = tk.Frame(page, bg=CARD, highlightbackground="#e5e7eb",
+                       highlightthickness=1)
+        top.pack(fill="x")
+        top_in = tk.Frame(top, bg=CARD)
+        top_in.pack(fill="x", padx=16, pady=12)
+
+        tk.Label(top_in, text="游戏装在哪个盘 / 文件夹？", bg=CARD, fg=TEXT,
+                 font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
+        tk.Label(top_in,
+                 text="指一个大一点的位置（比如整个盘、或 SteamLibrary 文件夹），"
+                      "我会把里面的游戏都找出来。",
+                 bg=CARD, fg=MUTED, font=("Microsoft YaHei UI", 9),
+                 anchor="w", justify="left").pack(anchor="w", pady=(2, 0))
+
+        row = tk.Frame(top_in, bg=CARD)
+        row.pack(fill="x", pady=(10, 0))
+        self.lib_root_var = tk.StringVar(value="")
+        self.lib_root_entry = tk.Entry(
+            row, textvariable=self.lib_root_var,
+            font=("Microsoft YaHei UI", 10), bd=1, relief="solid")
+        self.lib_root_entry.pack(side="left", fill="x", expand=True, ipady=6)
+        self.lib_root_entry.bind("<Return>", lambda e: self.lib_scan())
+        self.lib_choose_btn = tk.Button(
+            row, text="选择文件夹", command=self.lib_choose_dir,
+            bg=IDLE_BTN, fg=TEXT, activebackground=IDLE_BTN_HOVER,
+            relief="flat", cursor="hand2",
+            font=("Microsoft YaHei UI", 10, "bold"), padx=14, pady=6)
+        self.lib_choose_btn.pack(side="left", padx=(8, 0))
+        self.lib_scan_btn = tk.Button(
+            row, text="🔍 扫描游戏", command=self.lib_scan,
+            bg=ACCENT, fg="white", activebackground=ACCENT_DARK,
+            activeforeground="white", relief="flat", cursor="hand2",
+            font=("Microsoft YaHei UI", 10, "bold"), padx=16, pady=6)
+        self.lib_scan_btn.pack(side="left", padx=(8, 0))
+
+        # 常见位置一键填（用户连路径都不用找）
+        self.lib_quick_row = ButtonRow(top_in, bg=CARD)
+        self.lib_quick_row.pack(fill="x", pady=(8, 0))
+
+        self.lib_hint = tk.Label(
+            top_in, text="", bg=CARD, fg=MUTED,
+            font=("Microsoft YaHei UI", 8), anchor="w", justify="left")
+        self.lib_hint.pack(fill="x", pady=(6, 0))
+        wrap_to_parent(self.lib_hint, top_in)
+
+        # ---- ② 游戏表 ----
+        mid = tk.Frame(page, bg=CARD, highlightbackground="#e5e7eb",
+                       highlightthickness=1)
+        mid.pack(fill="both", expand=True, pady=(8, 0))
+
+        head_row = tk.Frame(mid, bg=CARD)
+        head_row.pack(fill="x", padx=16, pady=(10, 0))
+        self.lib_summary = tk.Label(
+            head_row, text="还没有扫描。", bg=CARD, fg=TEXT,
+            font=("Microsoft YaHei UI", 10, "bold"), anchor="w")
+        self.lib_summary.pack(side="left")
+        self.lib_rescan_btn = tk.Button(
+            head_row, text="🔄 重新扫描", command=self.lib_scan,
+            bg=IDLE_BTN, fg=TEXT, activebackground=IDLE_BTN_HOVER,
+            relief="flat", cursor="hand2",
+            font=("Microsoft YaHei UI", 9), padx=10, pady=3)
+        self.lib_rescan_btn.pack(side="right")
+
+        style = ttk.Style()
+        style.configure("Lib.Treeview",
+                        background="#ffffff", fieldbackground="#ffffff",
+                        foreground=TEXT, rowheight=26,
+                        font=("Microsoft YaHei UI", 10))
+        style.configure("Lib.Treeview.Heading",
+                        font=("Microsoft YaHei UI", 9, "bold"),
+                        background="#f3f4f6", foreground=MUTED)
+        style.map("Lib.Treeview", background=[("selected", "#dbeafe")],
+                  foreground=[("selected", "#1e40af")])
+
+        tree_wrap = tk.Frame(mid, bg=CARD)
+        tree_wrap.pack(fill="both", expand=True, padx=16, pady=(8, 0))
+        cols = ("game", "status", "type", "path")
+        self.lib_tree = ttk.Treeview(
+            tree_wrap, columns=cols, show="headings", selectmode="browse",
+            style="Lib.Treeview", height=12)
+        for cid, text, width, stretch in (
+                ("game", "游戏", 260, False),
+                ("status", "状态", 130, False),
+                ("type", "类型", 170, False),
+                ("path", "位置", 320, True)):
+            self.lib_tree.heading(cid, text=text)
+            self.lib_tree.column(cid, width=width, stretch=stretch,
+                                 anchor="w")
+        vs = ttk.Scrollbar(tree_wrap, orient="vertical",
+                           command=self.lib_tree.yview)
+        self.lib_tree.configure(yscrollcommand=vs.set)
+        self.lib_tree.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        # 状态列上色（Treeview 不能按单元格上色，用行 tag 近似表达）
+        self.lib_tree.tag_configure("ok", foreground="#166534")
+        self.lib_tree.tag_configure("warn", foreground="#b45309")
+        self.lib_tree.tag_configure("muted", foreground="#9ca3af")
+        self.lib_tree.bind("<<TreeviewSelect>>",
+                           lambda e: self._lib_on_select())
+        self.lib_tree.bind("<Double-1>", lambda e: self.lib_apply())
+
+        self.lib_detail = tk.Label(
+            mid, text="", bg=CARD, fg=MUTED,
+            font=("Microsoft YaHei UI", 9), anchor="w", justify="left")
+        self.lib_detail.pack(fill="x", padx=16, pady=(6, 0))
+        wrap_to_parent(self.lib_detail, mid)
+
+        # ---- ③ 底部：任务进度（醒目）+ 操作 ----
+        # 用户是在这一页点的「汉化这个游戏」，进度就必须在这一页看得见 ——
+        # 而不是要切到「高级设置」才知道软件在动。
+        self.lib_stage = tk.Label(
+            mid, text="", bg=CARD, fg=ACCENT_DARK,
+            font=("Microsoft YaHei UI", 11, "bold"), anchor="w",
+            justify="left")
+        self.lib_stage.pack(fill="x", padx=16, pady=(10, 0))
+        wrap_to_parent(self.lib_stage, mid)
+
+        style.configure("Lib.Horizontal.TProgressbar", thickness=12,
+                        background=ACCENT)
+
+        self.lib_progress = ttk.Progressbar(
+            mid, style="Lib.Horizontal.TProgressbar", maximum=100, value=0)
+        self.lib_progress.pack(fill="x", padx=16, pady=(6, 0))
+
+        self.lib_status = tk.Label(
+            mid, text="", bg=CARD, fg=MUTED,
+            font=("Microsoft YaHei UI", 9), anchor="w", justify="left")
+        self.lib_status.pack(fill="x", padx=16, pady=(6, 0))
+        wrap_to_parent(self.lib_status, mid)
+
+        act = tk.Frame(mid, bg=CARD)
+        act.pack(fill="x", padx=16, pady=(10, 12))
+        self.lib_apply_btn = tk.Button(
+            act, text="▶  汉化这个游戏", command=self.lib_apply,
+            bg=OK_GREEN, fg="white", activebackground="#128a3e",
+            activeforeground="white", relief="flat", cursor="hand2",
+            font=("Microsoft YaHei UI", 12, "bold"), padx=22, pady=9,
+            state="disabled")
+        self.lib_apply_btn.pack(side="left")
+        self.lib_revert_btn = tk.Button(
+            act, text="↩  还原原版", command=self.lib_revert,
+            bg="#fee2e2", fg="#991b1b", activebackground="#fecaca",
+            relief="flat", cursor="hand2",
+            font=("Microsoft YaHei UI", 10), padx=14, pady=9,
+            state="disabled")
+        self.lib_revert_btn.pack(side="left", padx=(8, 0))
+        self.lib_open_btn = tk.Button(
+            act, text="📂 打开文件夹", command=self.lib_open_dir,
+            bg=IDLE_BTN, fg=TEXT, activebackground=IDLE_BTN_HOVER,
+            relief="flat", cursor="hand2",
+            font=("Microsoft YaHei UI", 10), padx=14, pady=9,
+            state="disabled")
+        self.lib_open_btn.pack(side="left", padx=(8, 0))
+
+        # 游戏库自己的状态
+        self._lib_entries: list[GameEntry] = []
+        self._lib_thread: threading.Thread | None = None
+        self._lib_cancel = threading.Event()
+        self._lib_scanned_root = ""
+        self._lib_quick_roots = []
+        self._lib_boot_queue = []
+        self._lib_boot_mode = False
+
+    def _lib_bootstrap(self) -> None:
+        """开机自动准备游戏库：探测常见位置，并直接扫最可能的那个。
+
+        用户开软件应该**立刻看到一张游戏表**，而不是面对一个空框。
+        探测 + 扫描都走 ``after`` 链（不挡窗口首帧），扫描本身再进后台线程。
+
+        ⚠️ 探测失败**绝不能**让软件起不来 —— 这里一律兜住，最差也只是
+        让用户自己点「选择文件夹」指一个盘。
+        """
+        if self._closing:
+            return
+        try:
+            self._lib_fill_quick()
+        except Exception as e:                 # noqa: BLE001
+            self._lib_quick_roots = []
+            self._log(f"探测常见游戏位置失败（不影响使用）：{e}", "warn")
+        if not self._lib_quick_roots:
+            self.lib_status.configure(
+                text="没自动找到游戏位置 —— 点「选择文件夹」指一下游戏装在"
+                     "哪个盘就行（例：D:\\）。", fg=MUTED)
+            return
+        self._log(f"自动发现 {len(self._lib_quick_roots)} 个常见游戏位置，"
+                  "开始找游戏…", "info")
+        # 一个位置没扫到游戏就接着试下一个 —— 用户的机器上常有多个 Steam 库，
+        # 头一个（比如机械盘上那个空库）不一定装着游戏。用户开软件就该看见
+        # 一张表，而不是一句「没扫到」。
+        self._lib_boot_queue = [str(p) for p in self._lib_quick_roots]
+        self._lib_boot_mode = True
+        self._lib_boot_next()
+
+    def _lib_boot_next(self) -> bool:
+        """开机连扫：换下一个候选位置。还有得试 → True（新扫描已接管）。"""
+        while self._lib_boot_queue:
+            root = self._lib_boot_queue.pop(0)
+            if root == self._lib_scanned_root:
+                continue
+            self.lib_root_var.set(root)
+            if self.lib_scan():
+                return True
+            break                              # 扫不动（有别的任务在跑）
+        self._lib_boot_mode = False
+        self._lib_boot_queue = []
+        return False
+
+    def _lib_fill_quick(self) -> None:
+        """把探测到的常见游戏位置做成一排快捷按钮。"""
+        try:
+            roots = common_roots()
+        except Exception:                      # noqa: BLE001
+            roots = []
+        self._lib_quick_roots = roots[:4]
+        self.lib_quick_row.clear()
+        for p in self._lib_quick_roots:
+            short = str(p)
+            if len(short) > 34:
+                short = "…" + short[-33:]
+            b = tk.Button(
+                self.lib_quick_row, text=f"📁 {short}",
+                command=lambda q=str(p): self._lib_use_root(q),
+                relief="flat", cursor="hand2", bd=0,
+                font=("Microsoft YaHei UI", 9), padx=10, pady=5,
+                bg="#eef6ff", fg="#1e40af",
+                activebackground="#dbeafe", activeforeground="#1e40af")
+            self.lib_quick_row.add(b)
+        if self._lib_quick_roots:
+            self.lib_hint.configure(
+                text=f"上面这几个是自动找到的游戏位置，点一下就能扫。"
+                     f"（共 {len(roots)} 处）")
+        else:
+            self.lib_hint.configure(
+                text="没自动找到常见游戏位置 —— 点「选择文件夹」指一下"
+                     "游戏装在哪个盘就行。")
+
+    def _lib_use_root(self, path: str) -> None:
+        self.lib_root_var.set(path)
+        self.lib_scan()
+
+    def lib_choose_dir(self):
+        d = filedialog.askdirectory(
+            title="选择游戏所在的盘或文件夹（例：D:\\ 或 D:\\SteamLibrary）")
+        if not d:
+            return
+        self.lib_root_var.set(d)
+        self.lib_scan()
+
+    # ---- 扫描 ----
+
+    def lib_scan(self):
+        """开始扫一个位置。返回值 = 是否真的开跑了（被别的任务挡住时 False）。"""
+        root = (self.lib_root_var.get() or "").strip().strip('"')
+        if not root:
+            messagebox.showinfo(APP_NAME, "先选一个盘或文件夹，比如 D:\\ 。")
+            return False
+        if not Path(root).exists():
+            messagebox.showwarning(APP_NAME, f"这个位置不存在：\n{root}")
+            return False
+        if self._lib_thread is not None and self._lib_thread.is_alive():
+            return False
+        if self._pkg_busy() or (self.worker and self.worker.is_alive()):
+            messagebox.showinfo(APP_NAME, "有任务在跑，等它结束再扫描。")
+            return False
+
+        self._lib_cancel = threading.Event()
+        self._lib_scanned_root = root
+        self._lib_entries = []
+        self.lib_tree.delete(*self.lib_tree.get_children())
+        self._lib_set_buttons(scanning=True)
+        self.lib_summary.configure(text=f"正在扫描 {root} …")
+        self.lib_detail.configure(text="")
+        self.lib_status.configure(text="软件正在找游戏，大目录可能要几十秒…",
+                                  fg=MUTED)
+        self.lib_progress.configure(value=0)
+        self._log(f"开始扫描：{root}", "info")
+        self._lib_thread = threading.Thread(
+            target=self._lib_scan_worker, args=(root,), daemon=True)
+        self._lib_thread.start()
+        return True
+
+    def _lib_scan_worker(self, root: str):
+        from gametl.core.package import list_packages
+        try:
+            pkgs = list_packages(self.app_home)
+        except Exception:                      # noqa: BLE001
+            pkgs = []
+
+        def prog(cur, total, desc):
+            self.root.after(0, self._lib_scan_progress, cur)
+
+        try:
+            paths = scan_games(Path(root),
+                               cancel_event=self._lib_cancel,
+                               on_progress=prog)
+        except Exception as e:                 # noqa: BLE001
+            self.root.after(0, self._lib_scan_done, [], str(e))
+            return
+
+        entries: list[GameEntry] = []
+        total = len(paths)
+        for i, p in enumerate(paths):
+            if self._lib_cancel.is_set():
+                break
+            try:
+                ps = self._read_project_state(p)
+            except Exception:                  # noqa: BLE001
+                ps = {}
+            try:
+                ent = describe_game(p, pkgs=pkgs, project_state=ps)
+            except Exception:                  # noqa: BLE001
+                continue
+            entries.append(ent)
+            self.root.after(0, self._lib_read_progress, i + 1, total, ent)
+        self.root.after(0, self._lib_scan_done, entries, "")
+
+    def _lib_scan_progress(self, cur: int) -> None:
+        self.lib_summary.configure(text=f"正在扫描…已看过 {cur} 个文件夹")
+        self.lib_progress.configure(mode="indeterminate")
+        try:
+            self.lib_progress.start(14)
+        except tk.TclError:
+            pass
+
+    def _lib_read_progress(self, cur: int, total: int, ent: GameEntry) -> None:
+        try:
+            self.lib_progress.stop()
+        except tk.TclError:
+            pass
+        self.lib_progress.configure(mode="determinate")
+        self.lib_progress.configure(value=int(cur / max(1, total) * 100))
+        self.lib_summary.configure(
+            text=f"找到 {total} 个游戏，正在读状态…（{cur}/{total}）"
+                 f"　最新：{ent.name}")
+        self._lib_insert(ent)
+
+    def _lib_insert(self, ent: GameEntry) -> None:
+        """往表格里加一行。
+
+        ⚠️ 必须同时往 ``self._lib_entries`` 里追加 —— 行的 iid 就是它在
+        这个列表里的下标，选中行时靠它反查数据。之前只 insert 不 append，
+        所有行 iid 都是 "0"（第二行直接抛 TclError），选中也永远拿不到数据。
+        """
+        idx = len(self._lib_entries)
+        self._lib_entries.append(ent)
+        tag = "ok" if ent.kind == KIND_OK else (
+            "warn" if ent.kind == KIND_WARN else (
+                "muted" if ent.kind == KIND_MUTED else ""))
+        self.lib_tree.insert(
+            "", "end", iid=str(idx),
+            values=(ent.name, ent.status, ent.engine_label, ent.path),
+            tags=(tag,) if tag else ())
+
+    def _lib_scan_done(self, entries: list, err: str) -> None:
+        try:
+            self.lib_progress.stop()
+        except tk.TclError:
+            pass
+        self.lib_progress.configure(mode="determinate", value=0)
+        self._lib_set_buttons(scanning=False)
+
+        if err:
+            self.lib_summary.configure(text="扫描失败")
+            self.lib_status.configure(text=f"扫描失败：{err}", fg=ERR_RED)
+            self._log(f"扫描失败：{err}", "err")
+            return
+
+        # 开机自动连扫：这个位置没游戏就换下一个（见 _lib_bootstrap）。
+        # 手动扫描不走这条路 —— 用户指哪儿就扫哪儿，扫不到就如实告诉他。
+        if self._lib_boot_mode:
+            if entries:
+                self._lib_boot_mode = False
+                self._lib_boot_queue = []
+            else:
+                self._log(f"{self._lib_scanned_root} 里没找到游戏，"
+                          "换个位置继续找…", "info")
+                if self._lib_boot_next():
+                    return
+
+        # 以工作线程给的列表为准（可能是空 —— 空就必须真的清空，
+        # 否则上一轮扫出来的行会阴魂不散地留在数据里）
+        self._lib_entries = list(entries)
+        s = summarize(self._lib_entries)
+        txt = summary_text(s)
+        self.lib_summary.configure(text=txt)
+        self.lib_status.configure(
+            text=("在表格里选一个游戏，点「▶ 汉化这个游戏」。"
+                  "已经汉化过的可以点「↩ 还原原版」。"), fg=MUTED)
+        self._log(f"扫描完成：{txt}", "ok")
+
+        if not self._lib_entries:
+            self.lib_status.configure(
+                text="这个位置里没找到游戏。换一个盘 / 文件夹再试 —— "
+                     "比如游戏实际装在 D 盘的话，就扫 D:\\ 。", fg=WARN_AMBER)
+        self._lib_refresh_buttons()
+
+    def _lib_set_buttons(self, *, scanning: bool) -> None:
+        for name, on in (("lib_scan_btn", not scanning),
+                         ("lib_rescan_btn", not scanning),
+                         ("lib_choose_btn", not scanning)):
+            b = getattr(self, name, None)
+            if b is None:
+                continue
+            try:
+                b.configure(state="disabled" if scanning else "normal")
+            except tk.TclError:
+                pass
+        if scanning:
+            for name in ("lib_apply_btn", "lib_revert_btn", "lib_open_btn"):
+                b = getattr(self, name, None)
+                if b is not None:
+                    try:
+                        b.configure(state="disabled")
+                    except tk.TclError:
+                        pass
+            self.lib_scan_btn.configure(text="扫描中…")
+        else:
+            self.lib_scan_btn.configure(text="🔍 扫描游戏")
+            self._lib_refresh_buttons()
+
+    def _lib_task(self, text: str = "", *, pct=None,
+                  kind: str = "info") -> None:
+        """游戏库页那行「正在干什么」+ 进度条。
+
+        用户是在这一页点的一键汉化，进度就必须在这一页看得见 —— 界面上
+        没有动静，用户会以为按钮没生效（实测踩过：装包其实在跑，但反馈
+        只在「高级设置」页，用户以为"点了没效果"）。
+        """
+        colors = {"info": ACCENT_DARK, "ok": OK_GREEN,
+                  "err": ERR_RED, "warn": WARN_AMBER}
+        try:
+            self.lib_stage.configure(text=text, fg=colors.get(kind, TEXT))
+        except (tk.TclError, AttributeError):
+            pass
+        if pct is None:
+            return
+        try:
+            self.lib_progress.stop()
+            self.lib_progress.configure(
+                mode="determinate",
+                value=max(0, min(100, int(pct))))
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _lib_progress_reset(self) -> None:
+        """把游戏库的进度条归零（任务开始 / 结束 / 失败都调一次）。"""
+        try:
+            self.lib_progress.stop()
+        except tk.TclError:
+            pass
+        try:
+            self.lib_progress.configure(mode="determinate", value=0)
+        except tk.TclError:
+            pass
+        self._lib_task("")
+
+    # ---- 选中 ----
+
+    def _lib_selected(self) -> GameEntry | None:
+        try:
+            sel = self.lib_tree.selection()
+        except (tk.TclError, AttributeError):
+            return None
+        if not sel:
+            return None
+        try:
+            i = int(sel[0])
+        except (TypeError, ValueError):
+            return None
+        if 0 <= i < len(self._lib_entries):
+            return self._lib_entries[i]
+        return None
+
+    def _lib_on_select(self) -> None:
+        ent = self._lib_selected()
+        if ent is None:
+            self.lib_detail.configure(text="")
+            self._lib_refresh_buttons()
+            return
+        bits = [f"{ent.name} —— {ent.status}"]
+        if ent.note:
+            bits.append(ent.note)
+        if ent.engine_label:
+            bits.append(f"类型：{ent.engine_label}")
+        if ent.pkg_verdict == "mismatch" and ent.pkg_name:
+            bits.append(f"⚠ 软件里那个「{ent.pkg_name}」跟它对不上，"
+                        "建议以翻译为主")
+        self.lib_detail.configure(text="　·　".join(bits))
+        self._lib_refresh_buttons()
+
+    def _lib_refresh_buttons(self) -> None:
+        ent = self._lib_selected()
+        busy = self._pkg_busy() or bool(
+            self.worker and self.worker.is_alive())
+        can_apply = bool(ent and not busy)
+        can_revert = bool(ent and ent.patched and not busy)
+        for btn, ok in ((self.lib_apply_btn, can_apply),
+                        (self.lib_revert_btn, can_revert),
+                        (self.lib_open_btn, bool(ent))):
+            try:
+                btn.configure(state="normal" if ok else "disabled")
+            except tk.TclError:
+                pass
+        if busy:
+            # 忙的时候按钮本身也要说话 —— 不然用户会以为点了没反应
+            try:
+                self.lib_apply_btn.configure(text="⏳ 正在处理，进度见下方…")
+            except tk.TclError:
+                pass
+            return
+        if ent is None:
+            return
+        # 按钮文案跟着这一行的状态走，用户不用自己判断该点哪个
+        try:
+            if ent.patched:
+                self.lib_apply_btn.configure(text="▶  重新装一次汉化")
+            elif ent.pkg_path and ent.pkg_verdict in ("match", "partial"):
+                self.lib_apply_btn.configure(text="⚡  一键汉化（不用等翻译）")
+            elif ent.units and ent.done >= ent.units:
+                self.lib_apply_btn.configure(text="▶  生成汉化版")
+            elif ent.units and ent.done:
+                self.lib_apply_btn.configure(
+                    text=f"▶  继续翻译（{ent.done}/{ent.units}）")
+            else:
+                self.lib_apply_btn.configure(text="▶  汉化这个游戏")
+        except tk.TclError:
+            pass
+
+    # ---- 一键处理（智能路由） ----
+
+    def lib_apply(self):
+        """「汉化这个游戏」—— 用户不用管底下是装包还是跑模型。
+
+        路由规则（全部自动）：
+        * 已经装过汉化 → 问一句要不要重装 / 改成还原
+        * 软件里有配得上的翻译包 → 直接装（几秒，不用等翻译）
+        * 其它 → 走正常的翻译流程
+        """
+        ent = self._lib_selected()
+        if ent is None:
+            messagebox.showinfo(APP_NAME, "先在表格里选一个游戏。")
+            return
+        self.lib_enter_game(ent)
+
+        if ent.patched and not (ent.pkg_path and
+                                ent.pkg_verdict in ("match", "partial")):
+            if messagebox.askyesno(
+                    APP_NAME,
+                    f"《{ent.name}》已经装过汉化了。\n\n"
+                    "要还原成原来的语言吗？\n"
+                    "（点「否」则什么都不做）"):
+                self.lib_revert()
+            return
+
+        if ent.engine == "unknown" and not ent.pkg_path:
+            messagebox.showwarning(
+                APP_NAME,
+                f"《{ent.name}》这层目录认不出游戏引擎 —— "
+                "它可能不是游戏根目录，或者这款游戏暂不支持。\n\n"
+                "如果确定是游戏，可以在「高级设置」里手动选它试试。")
+            return
+
+        if ent.pkg_path and ent.pkg_verdict in ("match", "partial"):
+            from gametl.core.package import list_packages
+            rec = None
+            for r in list_packages(self.app_home):
+                if str(r.get("path")) == ent.pkg_path:
+                    rec = r
+                    break
+            if rec is not None:
+                self._start_apply_package(Path(ent.path), rec)
+                return
+            self._log(f"软件里记的那个翻译包找不到了（{ent.pkg_path}）——"
+                      "这次改用模型翻译。", "warn")
+        self.start()
+
+    def lib_enter_game(self, ent: GameEntry) -> None:
+        """把界面状态切到「就是它了」：路径、按钮、工程进度一起更新。"""
+        self.game_dir = Path(ent.path)
+        try:
+            self.path_var.set(ent.path)
+        except tk.TclError:
+            pass
+        try:
+            self.start_btn.configure(state="normal")
+        except tk.TclError:
+            pass
+        try:
+            self.detect_label.configure(
+                text=f"识别引擎：{ent.engine_label}", fg=OK_GREEN)
+        except tk.TclError:
+            pass
+        try:
+            ps = self._read_project_state(self.game_dir)
+        except Exception:                      # noqa: BLE001
+            ps = {}
+        self._refresh_project_state(ps)
+        self._refresh_repo(rescan=False)
+
+    def lib_revert(self):
+        ent = self._lib_selected()
+        if ent is None:
+            messagebox.showinfo(APP_NAME, "先在表格里选一个游戏。")
+            return
+        self.lib_enter_game(ent)
+        self.revert_game()
+
+    def lib_open_dir(self):
+        ent = self._lib_selected()
+        if ent is None:
+            return
+        self._open_path(Path(ent.path))
+
+    def _lib_sync_after_change(self):
+        """装完 / 还原完之后，把表格里那一行的状态就地更新（不重扫）。"""
+        ent = self._lib_selected()
+        if ent is None:
+            return
+        try:
+            from gametl.core.patcher import patch_status
+            st = patch_status(Path(ent.path))
+            ent.patched = bool(st.get("installed"))
+            ent.patch_files = int(st.get("files") or 0)
+            ent.patch_package = str(st.get("package") or "")
+            ent.patch_at = str(st.get("created_at") or "")
+            from gametl.core.library import _decide_status
+            _decide_status(ent)
+        except Exception:                      # noqa: BLE001
+            return
+        i = self.lib_tree.selection()
+        if i:
+            tag = "ok" if ent.kind == KIND_OK else (
+                "warn" if ent.kind == KIND_WARN else (
+                    "muted" if ent.kind == KIND_MUTED else ""))
+            try:
+                self.lib_tree.item(i[0],
+                                   values=(ent.name, ent.status,
+                                           ent.engine_label, ent.path),
+                                   tags=(tag,) if tag else ())
+            except tk.TclError:
+                pass
+        self.lib_summary.configure(text=summary_text(summarize(self._lib_entries)))
+        self._lib_on_select()
 
     # ---------------- 分栏（左设置 / 右日志） ----------------
 
@@ -1357,7 +2066,10 @@ class App:
         out_dir = self.game_dir / "_汉化输出"
         self.cancel_event.clear()
         self.progress.configure(value=0)
+        self._lib_progress_reset()
         self.stage_var.set("准备中...")
+        self._lib_task("▶ 正在准备翻译…（第一次要启动引擎，可能等几十秒）",
+                       pct=0, kind="info")
         self.speed_var.set("")
         self.start_btn.configure(state="disabled")
         self.choose_btn.configure(state="disabled")
@@ -1418,6 +2130,8 @@ class App:
             host=self.model_host or "http://127.0.0.1:11435",
             model_file=self.runtime.model_file,
             glossary_path=self._find_glossary(),
+            auto_glossary=True,       # 没有术语表时自动造一份（译名一致性）
+            glossary_save_path=self.app_home / "glossary.json",
             profile=profile_key,
             target_lang=self.target_lang,
             enable_audit=True,
@@ -1429,6 +2143,7 @@ class App:
         self.worker = threading.Thread(
             target=self._run_pipeline, args=(cfg,), daemon=True)
         self.worker.start()
+        self._lib_refresh_buttons()      # 任务跑起来了 → 游戏库按钮跟着禁用
 
     def _work_root_path(self, game_dir: Path) -> Path:
         """中间产物默认落哪（纯计算，不碰磁盘）。"""
@@ -1517,6 +2232,7 @@ class App:
     def _refresh_project_state(self, state: dict):
         """把工程进度画到界面上，并据此调整主按钮的说法。"""
         self._project_state = state or {}
+        # （术语表从 v2.6.2 起全自动，界面上不再有按钮 —— 翻译前软件自己生成）
         # 只要工程里有译文，就允许导出翻译包 —— 不必先跑一遍流程
         if state and state.get("exists") and (state.get("filled") or 0) > 0:
             self._enable_btn("pkg_out_btn")
@@ -1607,6 +2323,86 @@ class App:
             if cand.exists():
                 return cand
         return None
+
+    # ---------------- 术语表自动生成 ----------------
+
+    def _busy(self) -> bool:
+        """有没有后台任务在跑（翻译主流程 / 一键汉化 / 术语生成）。"""
+        if self.worker and self.worker.is_alive():
+            return True
+        return self._pkg_busy()
+
+    def build_glossary_clicked(self):
+        """扫全篇原文自动生成术语表（后台线程，不阻塞界面）。
+
+        界面上**没有**这个按钮了 —— 从 v2.6.2 起术语表由翻译流程自动
+        生成（见 ``AutoConfig.auto_glossary``），用户不需要理解这个概念。
+        这个方法留着当内部能力（排查问题 / 将来接别的入口都用它）。
+        """
+        if not self.game_dir:
+            messagebox.showinfo(APP_NAME, "请先选择游戏文件夹。")
+            return
+        if self._busy():
+            messagebox.showinfo(APP_NAME, "还有任务在跑，请等它结束。")
+            return
+        proj = resolve_project_path(self.app_home, self.game_dir)
+        if proj is None:
+            messagebox.showwarning(
+                APP_NAME,
+                "还没有翻译结果。\n\n"
+                "请先完成一次汉化（或导入一份翻译包），再生成术语表。")
+            return
+        self._lib_task("📖 正在自动生成术语表…", kind="info")
+        self._log("开始生成术语表：扫描全篇原文 → 统计候选 → 模型精筛", "info")
+        self._log("  这一步不改动任何译文，只产出一份 glossary.json。", "info")
+        self.worker = threading.Thread(
+            target=self._build_glossary_worker, args=(proj,), daemon=True)
+        self.worker.start()
+
+    def _build_glossary_worker(self, proj_path: Path):
+        try:
+            from gametl.translators.glossary_extract import (
+                build_glossary, save_glossary)
+            from gametl.translators.ollama_backend import OllamaTranslator
+
+            project = self._load_project(proj_path)
+            self._log(f"工程载入：{len(project.units)} 条原文", "info")
+
+            tr = OllamaTranslator(
+                model=self.model_name or "gametl-model",
+                host=self.model_host or "http://127.0.0.1:11435",
+                options=options_from_profile(
+                    self.profile_var.get() or "turbo",
+                    self.runtime.model_file))
+            if not tr.health():
+                self._log("翻译服务未就绪，无法生成术语表。请先开始一次汉化，"
+                          "让引擎启动起来。", "err")
+                return
+
+            def cb(_c, _n, d):
+                self._log(f"  {d}", "info")
+
+            gl = build_glossary(
+                project.units, tr, target_lang=self.target_lang,
+                on_progress=cb,
+                on_log=lambda m: self._log(f"  {m}", "info"))
+            if not gl:
+                self._log("没有筛出可用的术语（这篇文本里可能没有专有名词）。",
+                          "warn")
+                return
+            dest = self.app_home / "glossary.json"
+            save_glossary(gl, dest)
+            self._log(f"✅ 术语表已生成：{dest}（{len(gl)} 条）", "ok")
+            for k, v in list(gl.items())[:10]:
+                self._log(f"    {k}  →  {v}", "info")
+            if len(gl) > 10:
+                self._log(f"    … 其余 {len(gl) - 10} 条见上面那个文件", "info")
+            self._log("以后每次翻译都会自动带上这份术语表（可手工编辑）。",
+                      "ok")
+        except Exception as e:  # noqa: BLE001
+            self._log(f"生成术语表失败：{e}", "err")
+        finally:
+            self._lib_progress_reset()
 
     def _run_pipeline(self, cfg: AutoConfig):
         # ---- 档位 / 模型若被改过，先让引擎按新设置重启 ----
@@ -1708,6 +2504,13 @@ class App:
         else:
             self.speed_var.set("")
             self.stage_var.set(f"{stage}：{desc}" if desc else stage)
+        # 游戏库页顶部也摆一份同样的进度 —— 用户在那边点的按钮，
+        # 不该切到「高级设置」才看得见它在干什么。
+        self._lib_task(self.stage_var.get(), pct=overall)
+        try:
+            self.lib_status.configure(text=self.stage_var.get(), fg=MUTED)
+        except tk.TclError:
+            pass
 
     @staticmethod
     def _fmt_dur(sec: float) -> str:
@@ -1758,6 +2561,8 @@ class App:
                         self._read_project_state(self.game_dir))
             except Exception:  # noqa: BLE001
                 pass
+            # 游戏库表格里的状态也跟着更新（刚翻完 → 「译文已备好」）
+            self._lib_sync_after_change()
 
             if getattr(result, "already_done", False):
                 msg = ("这个游戏上次就已经翻完了，本次没有重翻任何条目。\n"
@@ -1773,14 +2578,21 @@ class App:
                             f"（涉及 {result.audit_fixable} 条）。\n"
                             f"可以点「快速校对」查看详情并一键重翻。")
                 msg += f"\n输出位置：\n{result.output_dir}"
+            self._lib_task(
+                f"✅ 汉化完成：翻译 {result.translated_units} 条 · 成品在输出目录",
+                pct=100, kind="ok")
             messagebox.showinfo(APP_NAME, msg)
         elif getattr(result, "stage_reached", "") == "已取消":
             self.stage_var.set("已取消")
+            self._lib_task("已取消 —— 翻好的部分会保留，再点一次接着来",
+                           kind="warn")
             self._log("任务已取消。已翻译的部分会保留，重新开始即续传。", "warn")
         else:
             self.stage_var.set("❌ 出现错误")
+            self._lib_task(f"❌ 失败：{result.error}", kind="err")
             self._log(f"❌ {result.error}", "err")
             messagebox.showerror(APP_NAME, f"处理失败：\n\n{result.error}")
+        self._lib_refresh_buttons()
 
     def cancel(self):
         self.cancel_event.set()
@@ -2319,12 +3131,22 @@ class App:
                         pass
         else:
             self._refresh_repo_buttons()
+        self._lib_refresh_buttons()
 
     def _pkg_progress(self, cur: int, total: int, desc: str) -> None:
+        pct = max(0, min(100, cur * 100 // total)) if total else 0
         try:
             if total:
-                self.progress.configure(value=max(0, min(100, cur * 100 // total)))
+                self.progress.configure(value=pct)
             self.stage_var.set(desc or "处理中…")
+        except tk.TclError:
+            pass
+        # 游戏库页也要能看到进度 —— 用户在那边点的按钮，不能只在高
+        # 级设置页里跑进度条。
+        self._lib_task(f"⚡ {desc or '处理中…'}　{pct}%", pct=pct)
+        try:
+            if desc:
+                self.lib_status.configure(text=desc, fg=MUTED)
         except tk.TclError:
             pass
 
@@ -2333,15 +3155,24 @@ class App:
         if not self.game_dir:
             messagebox.showwarning(APP_NAME, "请先选择游戏文件夹")
             return
+        rec = self._selected_repo_pkg()
+        if rec is None:
+            messagebox.showwarning(APP_NAME, "请先在列表里选一个翻译包。")
+            return
+        self._start_apply_package(self.game_dir, rec)
+
+    def _start_apply_package(self, game_dir, rec, *, confirm: bool = True):
+        """把某个翻译包写进某个游戏。
+
+        「一键汉化」卡片和「游戏库」都走这一条路径 —— 两个入口，一套逻辑，
+        免得两个地方的行为慢慢长歪。
+        """
+        game_dir = Path(game_dir)
         if self._pkg_busy():
             messagebox.showinfo(APP_NAME, "翻译包任务还在跑，请等它结束。")
             return
         if self.worker and self.worker.is_alive():
             messagebox.showinfo(APP_NAME, "当前有任务在跑，请等它结束或先取消。")
-            return
-        rec = self._selected_repo_pkg()
-        if rec is None:
-            messagebox.showwarning(APP_NAME, "请先在列表里选一个翻译包。")
             return
         if rec.get("error"):
             messagebox.showerror(APP_NAME, f"这个包读不出来：\n{rec['error']}")
@@ -2356,10 +3187,10 @@ class App:
         else:
             warn = ""
 
-        if not messagebox.askyesno(
+        if confirm and not messagebox.askyesno(
                 APP_NAME,
                 "准备把汉化写进游戏：\n\n"
-                f"  游戏：{self.game_dir.name}\n"
+                f"  游戏：{game_dir.name}\n"
                 f"  翻译包：{rec.get('game') or rec['name']}\n"
                 f"  译文：{rec.get('units')} 条\n\n"
                 "会在游戏目录里**就地覆盖**含文字的文件，并自动备份原版，\n"
@@ -2370,19 +3201,22 @@ class App:
         self._set_pkg_busy(True)
         self.cancel_event.clear()
         self.progress.configure(value=0)
+        self._lib_progress_reset()
+        self._lib_task(f"⚡ 正在把「{rec.get('game') or rec['name']}」装进游戏…",
+                       pct=0)
         self._log("═" * 50, "info")
-        self._log(f"一键汉化：{rec.get('game') or rec['name']} → {self.game_dir}",
+        self._log(f"一键汉化：{rec.get('game') or rec['name']} → {game_dir}",
                   "ok")
         self.pkg_thread = threading.Thread(
-            target=self._apply_pkg_worker, args=(Path(rec["path"]),),
+            target=self._apply_pkg_worker, args=(game_dir, Path(rec["path"])),
             daemon=True)
         self.pkg_thread.start()
 
-    def _apply_pkg_worker(self, pkg: Path):
+    def _apply_pkg_worker(self, game_dir: Path, pkg: Path):
         try:
             from gametl.core import patcher
             res = patcher.apply_patch(
-                self.game_dir, pkg,
+                game_dir, pkg,
                 on_log=lambda m: self.root.after(0, self._log, m, "info"),
                 on_progress=lambda c, n, d: self.root.after(
                     0, self._pkg_progress, c, n, d),
@@ -2396,6 +3230,10 @@ class App:
         self._set_pkg_busy(False)
         self.progress.configure(value=100)
         self.stage_var.set("汉化已装好")
+        filled = res.get("filled") or 0
+        self._lib_task(
+            f"✅ 汉化已装好：命中译文 {filled} 条 · 改动 {res.get('files')} 个文件",
+            pct=100, kind="ok")
         self._log("✅ 汉化已经写进游戏。", "ok")
         self._log(f"   改动 {res.get('files')} 个文件 · 命中译文 "
                   f"{res.get('filled')} 条（精确 {res.get('by_uid')}"
@@ -2416,12 +3254,16 @@ class App:
             "现在直接启动游戏就是中文了。\n"
             "想换回原来的语言，点一下「↩ 还原原版」。")
         self._refresh_repo(rescan=False)
+        self._lib_sync_after_change()
 
     def _apply_pkg_fail(self, err: str):
         self._set_pkg_busy(False)
         self.progress.configure(value=0)
+        self._lib_progress_reset()
         self.stage_var.set("汉化失败")
+        self._lib_task(f"❌ 汉化失败：{err}", kind="err")
         self._log(f"一键汉化失败：{err}", "err")
+        self._lib_refresh_buttons()
         messagebox.showerror(APP_NAME, f"一键汉化失败：\n{err}")
 
     def revert_game(self):
@@ -2469,12 +3311,14 @@ class App:
         self.progress.configure(value=0)
         self.stage_var.set("已还原原版")
         n = res.get("restored") or 0
+        self._lib_task(f"↩ 已还原成原版（{n} 个文件）", pct=100, kind="ok")
         self._log(f"✅ 已还原成原版（{n} 个文件）", "ok")
         if res.get("missing"):
             self._log(f"   {len(res['missing'])} 个文件没能还原："
                       f"{'、'.join(map(str, res['missing'][:3]))}…", "warn")
         messagebox.showinfo(APP_NAME, f"已经还原成原版了（{n} 个文件）。")
         self._refresh_repo(rescan=False)
+        self._lib_sync_after_change()
 
     def add_package_to_software(self):
         """把别处的 .gtpkg 收进软件自带的包目录。"""
@@ -2720,6 +3564,10 @@ def main():
         _selfcheck()
         return
 
+    # 开机自检：真构造一次界面再自己退出（验证「双击真的能开」）
+    if "--boot-test" in sys.argv:
+        raise SystemExit(_boot_test())
+
     # 安装器模式：这个 exe 被当成「汉化安装器」发出去时走这里
     try:
         from gametl.installer import main as installer_main, want_installer
@@ -2735,6 +3583,83 @@ def main():
     root.mainloop()
 
 
+def _boot_test() -> int:
+    """开机自检：**真构造一次界面**，跑一会儿，然后自己关掉。
+
+    为什么 ``--selfcheck`` 不够用：自检只验「依赖能不能 import」。而 v2.6.0
+    首版的事故是依赖全好、界面一构造就崩 —— ``__init__`` 里挂了个
+    ``self._lib_bootstrap`` 回调，方法却漏写了，用户双击只看到
+    「AttributeError: 'App' object has no attribute ...」。
+
+    这里走的是**和用户双击完全相同的代码路径**（tk.Tk → App → mainloop），
+    只是把窗口藏起来、到点自动退，结果写文件（GUI 程序没有 stdout）。
+    引擎/硬件探测这两条慢线程会被跳掉 —— 它们跟「界面能不能开」无关。
+    """
+    out = Path(os.environ.get("GAMETL_BOOTLOG", "boot_test.txt"))
+    lines = [f"### {APP_NAME} v{APP_VERSION} 开机自检"]
+
+    def rec(ok: bool, msg: str):
+        lines.append(f"[{'OK' if ok else 'FAIL'}] {msg}")
+
+    root = None
+    try:
+        # 打桩：别真去拉翻译引擎（要几秒且吃显存）/ 别去探显卡
+        App._prepare_engine = lambda self: None          # type: ignore
+        App._detect_hw = lambda self: None               # type: ignore
+
+        root = tk.Tk()
+        root.withdraw()                                  # 不闪窗口
+        app = App(root)                                  # ★ 真跑 __init__
+        rec(True, "界面构造成功（this 就是用户双击走的那条路）")
+
+        err: list = []
+        root.report_callback_exception = (
+            lambda exc, val, tb: err.append(f"{exc.__name__}: {val}"))
+
+        t0 = time.time()
+
+        def poll():
+            if err:
+                root.quit()
+                return
+            if app._lib_entries or time.time() - t0 > 20:
+                root.quit()
+                return
+            root.after(100, poll)
+
+        root.after(100, poll)
+        root.mainloop()
+
+        rec(not err, f"运行期回调异常：{err}" if err else "运行期无回调异常")
+        rec(True, f"开机自动扫描位置：{app._lib_scanned_root or '（没探测到候选）'}")
+        n_rows = len(app.lib_tree.get_children())
+        rec(n_rows == len(app._lib_entries),
+            f"游戏表：{n_rows} 行 / 数据 {len(app._lib_entries)} 条")
+        rec(bool(app.nb.tabs()), f"页签：{[app.nb.tab(t, 'text').strip() for t in app.nb.tabs()]}")
+
+        try:
+            app.on_close()
+            rec(True, "关窗收尾正常")
+        except Exception as e:  # noqa: BLE001
+            rec(False, f"关窗收尾异常：{e}")
+        return 0 if all(x.startswith("[OK]") for x in lines[1:]) else 1
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        rec(False, f"开机失败：{type(e).__name__}: {e}")
+        lines.extend(traceback.format_exc().splitlines())
+        return 1
+    finally:
+        try:
+            if root is not None:
+                root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+
 def _selfcheck():
     """打包自检：验证所有依赖可导入，把结果写入文件（GUI 程序无法用 stdout）。"""
     out = Path(os.environ.get("GAMETL_SELFCHECK", "selfcheck.txt"))
@@ -2746,6 +3671,77 @@ def _selfcheck():
     rec(True, f"frozen={getattr(sys, 'frozen', False)}")
     rec(True, f"BASE_DIR={BASE_DIR}")
     rec(True, f"APP_DIR={APP_DIR}")
+
+    # ---- dfpf 回填结构（v2.6.2）：换来的两条铁律 ----
+    # 事故：CQ2「一键汉化」后游戏启动卡死、窗口关不掉。复盘发现原版包
+    #    ① .~p 里每个资源都按 2048 对齐；② .~h 里记着"数据区结束位置"。
+    #    旧的整包重建两个都破坏了。这条自检跑一遍最小合成包盯住它们。
+    try:
+        import tempfile as _tf2
+        from gametl.core.dfpf import SECTOR, DfpfPack, build_synthetic_v5
+        with _tf2.TemporaryDirectory(prefix="gametl_dfpf_sc_") as _td2:
+            _td2 = Path(_td2)
+            _h2, _p2 = _td2 / "T.~h", _td2 / "T.~p"
+            _st = (b"StringTable{LineCodeData={A=LineCodeData{"
+                   b'Text="hi";VolumeDB=0;Character=Text;SoundCue=;};};}')
+            build_synthetic_v5(_h2, _p2, [
+                ("stringtable/a", _st, 0, True),
+                ("data/x", b"y" * 3000, 1, False)])
+            _pk = DfpfPack.open(_h2)
+            _old_end = _pk.data_end
+            # 故意用**不可压缩**的随机字节：这样新数据一定塞不进原槽位，
+            # 强制走「搬到数据区末尾」那条路（这才是出过事的那条）。
+            _big = b"StringTable{LineCodeData={" + os.urandom(9000) + b"};}"
+            _pk.write({"stringtable/a": _big},
+                      _td2 / "O.~h", _td2 / "O.~p")
+            _pk2 = DfpfPack.open(_td2 / "O.~h")
+            _ents = [e for e in _pk2.entries if e.size]
+            rec(all(e.offset % SECTOR == 0 for e in _ents),
+                "dfpf 回填：资源偏移保持 2048 对齐")
+            rec(_pk2.data_end > _old_end
+                and _pk2.data_end >= max(e.offset + e.size for e in _ents)
+                and _pk2.data_end % SECTOR == 0,
+                f"dfpf 回填：数据区长度同步更新（{_old_end} → {_pk2.data_end}）")
+            rec(_pk2.read(_pk2.find("stringtable/a")) == _big,
+                "dfpf 回填：搬走的资源内容正确")
+            rec(_pk2.read(_pk2.find("data/x")) == b"y" * 3000,
+                "dfpf 回填：同包其它资源未受影响")
+    except Exception as _e:  # noqa: BLE001
+        rec(False, f"dfpf 回填结构自检异常：{_e}")
+
+    # ---- 游戏库（v2.6.0）：傻瓜式主界面的底座 ----
+    # ⚠️ 这几条 hasattr 是血换来的：v2.6.0 首版 __init__ 挂了个
+    #    self._lib_bootstrap 回调却没写方法，依赖全好、界面一开就崩。
+    #    打包后拿不到源码，只能这样盯住「启动链上要用的方法是否都在」。
+    for _m in ("_lib_bootstrap", "_lib_boot_next", "_lib_fill_quick",
+               "_lib_scan_worker", "_lib_scan_done", "_lib_insert",
+               "_lib_refresh_buttons", "_lib_sync_after_change",
+               "_lib_task", "_lib_progress_reset"):
+        rec(hasattr(App, _m), f"游戏库：界面方法 {_m} 存在")
+    try:
+        import tempfile as _tf
+        from gametl.core import library as _lib
+        _roots = _lib.common_roots()
+        rec(all(p.is_dir() for p in _roots),
+            f"游戏库：常见位置探测（{len(_roots)} 处，全部真实存在）")
+        _s = _lib.summarize([])
+        rec(_s.get("total") == 0 and isinstance(_lib.summary_text(_s), str),
+            "游戏库：空结果统计与说明文案")
+        with _tf.TemporaryDirectory(prefix="gametl_lib_sc_") as _td:
+            _td = Path(_td)
+            _g = _td / "FakeGame"
+            (_g / "www" / "data").mkdir(parents=True)
+            (_g / "www" / "data" / "System.json").write_text(
+                '{}', encoding="utf-8")
+            (_g / "Game.exe").write_bytes(b"MZ")
+            _found = _lib.scan_games(_td)
+            rec([p.name for p in _found] == ["FakeGame"],
+                "游戏库：内置扫描能从目录里找出游戏")
+            _ent = _lib.describe_game(_g)
+            rec(_ent.status == _lib.ST_NEW and bool(_ent.engine_label),
+                f"游戏库：状态判定（{_ent.engine_label} / {_ent.status}）")
+    except Exception as e:  # noqa: BLE001
+        rec(False, f"游戏库: {e}")
 
     # ---- 增量落盘（JSONL journal）----
     try:
@@ -2997,6 +3993,61 @@ def _selfcheck():
                 "坏包留在列表里并带 error（不会被静默忽略）")
     except Exception as e:  # noqa: BLE001
         rec(False, f"包仓库: {e}")
+
+    # ---- 术语表自动生成（v2.5：译名一致性） ----
+    try:
+        import json as _j5
+        import re as _re5
+        import tempfile as _tf5
+        from gametl.translators.glossary import Glossary as _G5
+        from gametl.translators.glossary_extract import (
+            build_glossary, can_refine, collect_candidates, refine_with_llm,
+            save_glossary)
+
+        _sample5 = [
+            "Wren went to the Candy Corn shop.",
+            "Then Wren met Everett at the Candy Corn shop.",
+            "Everett said the Candy Corn was stale.",
+            "I'm not sure about that, said Wren.",
+        ]
+        _cand5 = collect_candidates(_sample5, max_candidates=50)
+        _names5 = {c[0] for c in _cand5}
+        rec("Wren" in _names5 and "Everett" in _names5,
+            "术语统计层能召回人名（Wren / Everett）")
+        rec("Candy Corn" in _names5, "术语统计层能召回多词术语（Candy Corn）")
+        rec(not any(t.startswith("I'") for t in _names5),
+            "术语统计层过滤掉 I'm / I'll 这类缩写噪声")
+
+        class _FT5:                      # 假模型：只保留两个真术语
+            prompt_style = "generic"
+
+            def generate(self, prompt, **kw):
+                got = _re5.findall(r"^\s*\d+\.\s*(.+)$", prompt, _re5.M)
+                return _j5.dumps({c: "译" + c for c in got
+                                  if c in ("Wren", "Everett")},
+                                 ensure_ascii=False)
+
+        _ref5 = refine_with_llm(_FT5(), _cand5, target_lang="简体中文")
+        rec(bool(_ref5.get("Wren")) and "Everett" in _ref5,
+            "模型精筛保留真术语、丢弃噪声")
+
+        class _HT5:
+            prompt_style = "hymt"
+
+        rec(can_refine(_FT5()) and not can_refine(_HT5()),
+            "能识别「翻译专用模型」不适合做术语判定")
+        rec(callable(build_glossary), "术语表生成入口可用")
+
+        with _tf5.TemporaryDirectory() as _td5:
+            _p5 = Path(_td5) / "glossary.json"
+            save_glossary({"Wren": "蕾恩"}, _p5)
+            _gl5 = _G5.load(_p5)
+            rec(len(_gl5) == 1
+                and _gl5.relevant_for("Wren here") == {"Wren": "蕾恩"}
+                and _gl5.relevant_for("nothing here") == {},
+                "术语表存盘 → 注入只命中真出现的术语")
+    except Exception as e:  # noqa: BLE001
+        rec(False, f"术语表: {e}")
 
     # ---- 增量导出 ----
     try:
