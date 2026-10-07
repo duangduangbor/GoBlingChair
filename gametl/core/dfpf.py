@@ -592,11 +592,14 @@ class DfpfPack:
         append_items: List[tuple] = []
         for ent, payload, raw in todo:
             slot = slot_of.get(id(ent), max(0, data_end - ent.offset))
-            # 未压缩资源的 size 必须**精确等于**数据长度（游戏照它读多少）；
-            # zlib 的要保证整条压缩流都在，多出来的位置清零即可 ——
-            # 解压时尾部的多余字节会被忽略。
-            keep = (len(raw) if ent.comp != COMP_ZLIB
-                    else max(len(raw), ent.size))
+            # ⚠️ size 必须**精确等于**新数据长度 —— 两种压缩方式都一样。
+            #
+            # 早期版本对 zlib 用 `max(len(raw), 原 size)`，以为"补零到原长度、
+            # 尾部多余字节解压时会被忽略"。**游戏不是这么干的**：它按 size 取
+            # size 字节丢给 zlib，尾部那串 0 会让解压报错 —— CQ2 实测症状是
+            # 启动即崩（0xC0000005）。留出的空洞无害（资源靠 offset 定位），
+            # 多写的填充才致命。
+            keep = len(raw)
             if len(raw) <= slot and ent.offset + keep <= data_end:
                 plan.append((ent, payload, raw, keep))
             else:

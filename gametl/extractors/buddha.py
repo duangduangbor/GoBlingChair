@@ -139,16 +139,126 @@ def escape(text: str) -> str:
                 .replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t"))
 
 
-_BARE_OK = re.compile(r"[A-Za-z0-9_]+")
+#: StringTable 是**靠括号配平**的自描述 DSL：``{`` ``}`` ``[`` ``]`` 都是结构
+#: 字符。可模型偶尔会把生成 JSON 时用的收尾符号（``}`` / ``]``）写进字符串值
+#: 里 —— 实测 CQ2 的 5 张英语表里混进了 216 处。落在 ``Text`` 值内的结构符号
+#: 会让整张表的配平错位，游戏解析时**启动即卡死或直接崩**（实测 0xC0000005）。
+#: 这类污染不改变长度以外的任何可见内容，用"比原文多就删"就能安全清掉。
+_BRACKETS = "{}[]"
+
+
+def strip_stray_brackets(new: str, old: str) -> str:
+    """删掉译文里**比原文凭空多出来**的结构符号。
+
+    只在"原文没有、译文才有"时动手，所以原文里合法的 ``{0}`` ``[name]``
+    之类一个都不会碰（它们的数量在两边相等）。多余符号优先从末尾删 ——
+    实测污染几乎都出现在值尾；末尾删不干净再从后往前删。
+    """
+    for ch in _BRACKETS:
+        extra = new.count(ch) - old.count(ch)
+        while extra > 0 and new.endswith(ch):
+            new = new[:-1]
+            extra -= 1
+        while extra > 0:
+            i = new.rfind(ch)
+            if i < 0:
+                break
+            new = new[:i] + new[i + 1:]
+            extra -= 1
+    return new
+
+
+def canonical_value(text: str, original: str) -> str:
+    """译文与原文**完全一样**时，直接沿用原文那一段字节（连引号风格都不动）。
+
+    这是 CQ2 事故（2026-10-07）的核心防线。详见 ``emit_value`` 的长注释。
+    """
+    return original
+
+
+# ============================================================ 解压后大小预算
+#
+# ★★★ dfpf 第三条硬约束：**资源「解压后的字节数」不能超过原版**。
+#
+# 2026-10-07 在 CQ2（`E:\游戏\CostumeQuest2`）上用**真机启动游戏**逐项排除：
+#   · 把资源搬到数据区末尾（offset 变）              → 正常
+#   · 压缩后大小变大（size 变）                      → 正常
+#   · 只改 data_end / 只改 .~p 文件大小              → 正常
+#   · 破坏记录顺序                                   → 正常
+#   · **usize（解压后字节数）变大**                  → 启动即死循环 / 0xC0000005
+#
+# 边界精确落在「原版 usize」上 —— ``stringtable/costumequest_usenglish``
+# 原版 usize=388657 字节：
+#   · 前 12 条译文  usize=388649  → 启动正常
+#   · 第 13 条译文  usize=388666  → 启动卡死（CPU 100% 空转、窗口关不掉）
+#   注意第 13 条那组的**压缩后**尺寸（82356）比"正常"那组（82579）还**小**，
+#   所以 size 不是判据 —— 只有 usize 能解释全部 12 组对照。
+#
+# 为什么中译一定会撞线：英文 1 字符 ≈ 1 字节，中文 UTF-8 **每字 3 字节**。
+# 全表字数从 388651 掉到 299538（−23%），字节数反而从 388657 涨到 393599
+# （+1.3%）。也就是说**译得再好也会超**，必须在回填时把它压回去。
+#
+# 社区佐证：DoubleFineTool（解包/重打包 dfpf 的工具）作者在 Brutal Legend
+# 上记录过同一现象 —— "adding bytes ... 10 bytes causes the game to
+# completely lock up"；同引擎（Buddha）、同症状。
+#
+# 对策：按阶段把**全角标点换成半角**（每个字符 3 字节 → 1 字节，省 2 字节），
+# 只压到刚好够用就停，尽量保住中文排版；实在压不进去就**整张表放弃、保原版**
+# —— 写坏了游戏直接起不来，宁可少翻一张表也不能让用户打不开游戏。
+#
+#: 全角 → 半角。分阶段是为了"能不换就不换"：先动观感影响最小的符号，
+#: 最后才动逗号句号。
+_PUN_STAGES: tuple = (
+    # 阶段 1：符号类，对中文观感影响最小
+    {"\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'",
+     "\uff08": "(", "\uff09": ")", "\u300a": "<", "\u300b": ">",
+     "\u3010": "[", "\u3011": "]", "\u3001": ",", "\uff1a": ":", "\uff1b": ";"},
+    # 阶段 2：叹号 / 问号
+    {"\uff01": "!", "\uff1f": "?"},
+    # 阶段 3：逗号 / 句号（最伤排版，最后才动）
+    {"\uff0c": ",", "\u3002": "."},
+)
+
+
+def _apply_pun_stage(text: str, stage: dict) -> str:
+    for k, v in stage.items():
+        if k in text:
+            text = text.replace(k, v)
+    return text
+
+
+def utf8_len(text: str) -> int:
+    """文本的 UTF-8 字节数 —— dfpf 预算按字节算，**不是**字符数。"""
+    return len(text.encode("utf-8"))
+
+
+#: 裸写值里**不能出现**的字符：``;`` 是值的终止符，``"`` ``\\`` 会改变词法，
+#: ``{`` ``}`` ``[`` ``]`` 是表结构符号，控制字符会打断行/表结构。
+_BARE_BAD = set(';"\\{}[]\r\n\t')
 
 
 def emit_value(text: str, was_quoted: bool) -> str:
     """按 DSL 规矩产出一个值。
 
-    · 原来没引号、新文本仍是纯 ASCII 标识符 → 保持裸写（不改无谓的字节）
-    · 其余一律加引号 —— 中文、空格、分号、引号都必须靠引号包住才合法
+    ★★ 铁律：**原文怎么写，就怎么写回去**（2026-10-07 CQ2 事故换来的）。
+
+    CQ2 的 StringTable 里大量值是**裸写**的，而且裸写值里允许出现
+    ``:`` ``-`` ``!`` ``.`` 这类"看起来该加引号"的字符 —— 原版里就有
+    ``Text=HP:`` / ``Text=AP:`` / ``Text=BOO!`` / ``Text=T.P.`` /
+    ``Text=Raz-Ums`` / ``Text=AAAAAAAAAAWWWW-`` 这样的写法。
+
+    早期实现用 ``[A-Za-z0-9_]+`` 判"能不能裸写"，把这些值统统改写成了
+    ``Text="HP:"``。**实测后果极其严重**：只把这 11 条加引号，游戏启动后
+    就**死循环** —— 窗口弹出但不响应、任务管理器里一个核跑满、CPU 时间
+    线性增长（15s→30s→45s→60s 完全不收敛）、点关闭毫无反应、只能重启
+    机器。单条加引号没事，5 条以上必挂；把压缩流补长到原长度也照样挂，
+    所以不是长度/对齐问题，就是引号本身。
+
+    结论：判据只能是"**裸写放不放得下**"。只要新文本里没有裸写放不下的
+    字符（分号 / 引号 / 反斜杠 / 结构符号 / 控制符），就保持裸写；否则
+    才退化成加引号。宁可少加引号，也不要多改一个字节。
     """
-    if not was_quoted and _BARE_OK.fullmatch(text):
+    if not was_quoted and not (_BARE_BAD & set(text)):
         return text
     return '"' + escape(text) + '"'
 
@@ -315,6 +425,7 @@ class BuddhaExtractor(BaseExtractor):
 
         written = replaced = unchanged = 0
         changed: list[str] = []
+        over_budget: list[str] = []
         for rel_h, units in by_pack.items():
             src_h = self.decoded_dir / rel_h
             if not src_h.is_file():
@@ -355,17 +466,53 @@ class BuddhaExtractor(BaseExtractor):
                             # 原文对不上 = 这张表不是我们提取的那一张
                             # （重名资源 / 版本不同），写了也是错的。
                             continue
-                        raw_new = emit_value(restore(u.translated, u.protected),
-                                             entries[i]["raw"].startswith('"'))
-                        if raw_new == entries[i]["raw"]:
+                        new_text = strip_stray_brackets(
+                            restore(u.translated, u.protected),
+                            entries[i]["value"])
+                        # ★ 译文与原文**一字不差** → 原文那一段一个字节都不碰。
+                        #   曾经这里会跟着 emit_value 把原本裸写的值改写成
+                        #   带引号，实测让 CQ2（2026-10-07）启动即死循环。
+                        #   详见 emit_value 的长注释与回归 test_v263_bare_value。
+                        if new_text == entries[i]["value"]:
                             continue
-                        new_values[i] = raw_new
+                        new_values[i] = new_text
                     if not new_values:
                         continue
-                    new_text, n = rebuild(text, entries, new_values)
+
+                    def _assemble(plain: dict) -> tuple:
+                        """把「纯文本译文」按原文的引号风格产出成整表 DSL。"""
+                        raws = {}
+                        for i, v in plain.items():
+                            raw_new = emit_value(
+                                v, entries[i]["raw"].startswith('"'))
+                            if raw_new != entries[i]["raw"]:
+                                raws[i] = raw_new
+                        return rebuild(text, entries, raws)
+
+                    new_text, n = _assemble(new_values)
                     if not n:
                         continue
-                    changes[ent] = new_text.encode("utf-8")
+
+                    # ★★ 解压后字节数必须 ≤ 原版（见 _PUN_STAGES 上方的长注释）。
+                    # 超了就把全角标点逐阶段换半角，够用即止。
+                    budget = int(ent.usize or 0)
+                    payload = new_text.encode("utf-8")
+                    if budget and len(payload) > budget:
+                        for stage in _PUN_STAGES:
+                            new_values = {i: _apply_pun_stage(v, stage)
+                                          for i, v in new_values.items()}
+                            new_text, n = _assemble(new_values)
+                            payload = new_text.encode("utf-8")
+                            if len(payload) <= budget:
+                                break
+                    if budget and len(payload) > budget:
+                        # 压不进去 → **整张表放弃，保原版**。写坏了游戏直接
+                        # 起不来（实测"黑屏 + 窗口关不掉 + CPU 空转"），
+                        # 宁可少翻一张表也不能让用户打不开游戏。
+                        over_budget.append(f"{rel_h}::{res_name}")
+                        continue
+
+                    changes[ent] = payload
                     n_here += n
                     break          # 这张表收工，同名的其余候选不用再看
 
@@ -388,7 +535,8 @@ class BuddhaExtractor(BaseExtractor):
                 unchanged += 2
 
         return wb_stats(files_written=written, replaced=replaced,
-                        unchanged=unchanged, changed=changed)
+                        unchanged=unchanged, changed=changed,
+                        over_budget=over_budget)
 
 
 # 延后绑定引擎枚举，避免 models → extractors 的循环引用

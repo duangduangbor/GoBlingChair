@@ -14,6 +14,9 @@
 !build_portable.py
 !make_icon.py
 
+# —— 放行：用户说明书（由 dist/使用说明.txt 同步到根目录后随之入库） ——
+!使用说明.txt
+
 # —— 放行：图标资源（仅 GoBlingChair 系列与 AI 生成头像） ——
 !assets/
 !assets/GoBlingChair.ico

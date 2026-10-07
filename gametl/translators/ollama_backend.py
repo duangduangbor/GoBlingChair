@@ -42,6 +42,46 @@ DEFAULT_HOST = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen2.5:7b"
 
 
+#: 提示词回声的指纹（2026-10-08 CQ2 事故换来的）。
+#:
+#: 小模型偶尔会在 JSON 里"串行"：先写译文，再把自己的指令/收尾语也写进同一个
+#: 字符串值。CQ2 实测 16 条中招，例如
+#: ``ACHV036TEXT`` 原文 ``Acquired the Pumpkin Costume.`` →
+#: ``获得了南瓜服装。}``` 提示：仅输出 JSON 对象…`` 输出：{``
+#: 这类值会原样回填进游戏 —— 又长又脏，还会把 ``{`` ``}`` 结构符号带进表里。
+#:
+#: 兜底交给 ``_clean`` 去"猜"太危险（可能把正常译文也截断），所以在**批量校验**
+#: 这一步直接判定整批作废：失败条目保持 ``translated=None``，续传时会重试。
+_LEAK_MARKERS: tuple = (
+    "```", "JSON", "json 对象", "markdown", "占位符", "不要输出", "不需要任何解释",
+    "译文不含换行符", "译文中没有", "无换行符", "保持原样输出", "键与输入",
+    "翻译结果", "输出结果如下", "最终输出如下", "以下是翻译", "好的，我将",
+    "好的，已", "按照您的要求", "按您的要求", "已按要求",
+)
+
+
+def looks_leaked(value: str, original: str) -> str:
+    """判断这条译文是不是"模型把提示词/收尾语也写进来了"。返回原因或空串。
+
+    判据有两条，任一命中即算污染：
+
+    1. 命中 ``_LEAK_MARKERS`` —— 正常译文里不会出现这些词；
+    2. 长度失控 —— 超过原文长度的 ``_LEAK_RATIO`` 倍且绝对值也够大。
+       中文一般比英文短，所以"译文比原文长好几倍"本身就是异常信号
+       （CQ2 实测 ACHV036TEXT 那条比值 17.8）。
+    """
+    t = (value or "").strip()
+    if not t:
+        return ""
+    low = t.lower()
+    for m in _LEAK_MARKERS:
+        if m.lower() in low:
+            return "疑似提示词回声（命中 %r）" % m
+    if len(original) >= 8 and len(t) > max(64, len(original) * 6):
+        return "疑似提示词回声（长度 %d，原文 %d）" % (len(t), len(original))
+    return ""
+
+
 SYSTEM_PROMPT = """你是一名专业的游戏本地化译者，负责将游戏文本翻译为目标语言。
 
 严格遵守以下规则：
@@ -484,6 +524,10 @@ class OllamaTranslator:
             if not isinstance(val, str):
                 return {}, f"第 {i} 条不是字符串"
             cleaned = self._clean(val.strip(), text)
+            leak = looks_leaked(cleaned, text)
+            if leak:
+                # 整批作废比"猜哪一段是译文"安全 —— 失败条目会在续传时重试。
+                return {}, f"第 {i} 条{leak}"
             if self.opt.verify:
                 bad = check_immediate(text, cleaned, target_lang=target_lang)
                 if bad:
@@ -535,7 +579,17 @@ class OllamaTranslator:
                 s = s[len(prefix):].strip()
         if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'“”":
             s = s[1:-1]
-        s = s.replace("\n", " ").strip()
+        # ★★ 换行是**内容**，不是噪声（2026-10-08 CQ2 换行丢失事故换来的）。
+        #
+        # 早期实现在这里写了 ``s.replace("\n", " ")`` —— 本意是"模型爱换行，
+        # 压成一行更整齐"。实测后果：CQ2 的 `stringtable/*` 里，服装说明这类
+        # 多行文本原版写成引号内的 ``\r\n`` 转义（如 ``Text="Focus: Attack\r\n
+        # Type: Melee\r\n..."``，游戏靠它分行显示）。译文回到这里时 ``\r`` 被
+        # 保留、``\n`` 被压成空格 → 落盘成 ``"\r "``，**整段文本挤成一行**
+        # （DRCI051/054/057、COST003/005/009/012/015/018/021/027/030 等 18 条）。
+        #
+        # 现在一律保留换行，只做 CRLF/CR → LF 归一，避免同一条里混着三种换行。
+        s = s.replace("\r\n", "\n").replace("\r", "\n").strip()
         return s
 
     # ---------------- 批量流水线 ----------------

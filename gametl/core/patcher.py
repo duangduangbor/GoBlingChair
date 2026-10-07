@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import tempfile
 import time
@@ -39,6 +40,73 @@ from ..extractors.base import wb_replaced
 
 BACKUP_DIRNAME = "_汉化备份_原版"
 MANIFEST_NAME = "gametl_restore.json"
+
+#: 我们改过的 User.cfg 会另存一份，还原时用它换回去
+WINDOWED_BAK_SUFFIX = ".mt_orig"
+
+
+def _ensure_windowed(game_dir: Path, engine, on_log: LogCb = None) -> bool:
+    """Double Fine 系：部署后把 ``forceWindowedMode`` 打开，规避全屏黑屏。
+
+    事故（2026-10-08，CQ2 实测）
+    ---------------------------
+    用户报「装完汉化游戏打不开、一开就黑屏」。逐项排除后确认**和汉化无关**：
+    游戏把显示设置记在 ``%APPDATA%\\Doublefine\\<游戏名>\\screen.dat``，这台
+    机器上被写成了 ``fullscreen = true / width = 0 / height = 0`` —— 全屏
+    初始化必然失败，于是原版也是黑屏（同一时刻原版 CPU 1.5s 空闲、汉化版
+    反而能进标题画面）。
+
+    PCGamingWiki 记的官方解法是游戏里按 **Alt+Enter** 切窗口化；落到配置
+    文件就是 ``Data/Config/User.cfg`` 里的 ``forceWindowedMode``。
+    这里部署汉化时顺手打开它，并且**只在原来不是 true 时才动**，
+    改前另存 ``User.cfg.mt_orig``，还原汉化时换回去。
+    """
+    if engine != EngineType.BUDDHA:
+        return False
+    cfg = game_dir / "Data" / "Config" / "User.cfg"
+    if not cfg.is_file():
+        return False
+    try:
+        text = cfg.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if not re.search(r"(?m)^\s*forceWindowedMode\s*=", text):
+        return False                     # 老版本配置里没这一项，别自作主张加
+    if re.search(r"(?m)^\s*forceWindowedMode\s*=\s*true\b", text):
+        return False                     # 已经是窗口化，一个字节都不碰
+
+    bak = cfg.with_name(cfg.name + WINDOWED_BAK_SUFFIX)
+    if not bak.exists():
+        try:
+            shutil.copy2(cfg, bak)
+        except OSError:
+            pass
+    new = re.sub(r"(?m)^(\s*forceWindowedMode\s*=\s*).*$", r"\1true", text)
+    if new == text:
+        return False
+    try:
+        cfg.write_text(new, encoding="utf-8")
+    except OSError as e:
+        _log(on_log, f"  [警告] User.cfg 写不进去（{e}）；若黑屏请按 Alt+Enter")
+        return False
+    _log(on_log, "已把 forceWindowedMode 设为 true"
+                 "（这台机器若全屏初始化失败会黑屏，详见说明书）")
+    return True
+
+
+def _restore_windowed(game_dir: Path, on_log: LogCb = None) -> None:
+    """还原汉化时，把 ``_ensure_windowed`` 改过的 User.cfg 换回来。"""
+    cfg = game_dir / "Data" / "Config" / "User.cfg"
+    bak = cfg.with_name(cfg.name + WINDOWED_BAK_SUFFIX)
+    if not (cfg.is_file() and bak.is_file()):
+        return
+    try:
+        shutil.copy2(bak, cfg)
+        bak.unlink()
+        _log(on_log, "已还原 User.cfg（回归你原来的显示设置）")
+    except OSError:
+        pass
+
 RESTORE_FORMAT = "gametl-restore"
 RESTORE_VERSION = 1
 BAK_SUFFIX = ".bak"
@@ -553,6 +621,9 @@ def apply_patch(game_dir: Path, package: Path, *,
                 except OSError as e:
                     _log(on_log, f"  [警告] 写不进去：{rel}（{e}）")
 
+    # Double Fine 系：顺手打开窗口化，规避全屏初始化失败导致的黑屏。
+    windowed = _ensure_windowed(game_dir, use_engine, on_log)
+
     return {
         "files": written,
         "filled": filled,
@@ -565,6 +636,7 @@ def apply_patch(game_dir: Path, package: Path, *,
         "made_backup": made_backup,
         "engine": use_engine.value,
         "repacked": need_repack,
+        "windowed_fixed": windowed,
     }
 
 
@@ -618,6 +690,8 @@ def revert_patch(game_dir: Path, *,
             _step(on_progress, i, len(entries) or 1, f"还原 {i}/{len(entries)}")
     _log(on_log, f"已还原 {restored} 个文件"
                  + (f"，{len(missing)} 个失败" if missing else ""))
+
+    _restore_windowed(game_dir, on_log)
 
     # 备份留着（下次还能装），但状态要翻回「未安装」，
     # 否则界面会一直说「已装汉化」，用户会以为还原没生效。

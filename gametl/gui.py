@@ -86,7 +86,7 @@ SASH_RETRY_MAX = 30
 
 APP_NAME = "滚刀哥布林汉化椅"
 APP_NAME_EN = "GoBlingChair"
-APP_VERSION = "2.6.2"
+APP_VERSION = "2.6.3"
 INSTALLER_NAME = "汉化安装器.exe"
 
 
@@ -4478,8 +4478,16 @@ def _selfcheck():
                 _k2 = [u for u in _us if u.location.get("key") == "K2"]
                 rec(bool(_k2) and "/BUTTON_DPadUp/" in (_k2[0].protected or ""),
                     "按键宏 /BUTTON_DPadUp/ 已保护")
+                # ★★ v2.6.3：伪翻译**必须自己遵守 usize 预算**，否则测到的
+                #    不是「回填」而是「预算闸门」。合成包的 usize == 原表长度
+                #    （零余量），任何"给每条加前缀"的伪翻译都会整表超预算 →
+                #    按新契约整表放弃 → 断言必然红。这里用**更短**的标记替换，
+                #    净字节只减不增，闸门不介入，才能验证回填本身。
+                _mark = {"K1": "ZK1", "K2": "ZK2"}
                 for _u in _us:
-                    _u.translated = "【自检】" + _u.original
+                    _m = _mark.get(_u.location.get("key"))
+                    if _m:
+                        _u.translated = _m
                 _out = _td / "out"
                 _s = _ex.write_back(
                     _P3(root=_td, engine=_ET3.BUDDHA, units=_us), _out)
@@ -4487,9 +4495,21 @@ def _selfcheck():
                     f"Buddha 合成回填索引+数据（{_s.get('changed')}）")
                 _pk2 = _DP.open(_out / "S.~h")
                 _txt = _pk2.read(_pk2.find("stringtable/enus")).decode("utf-8")
-                rec("【自检】Hello" in _txt, "Buddha 合成回填：重新解包命中")
+                rec("ZK1" in _txt and "ZK2" in _txt,
+                    "Buddha 合成回填：重新解包命中")
                 rec(_pk2.read(_pk2.find("data/blob")) == bytes(range(256)),
                     "Buddha 合成回填：其它资源零误伤")
+                # 反向：译文严重超预算 → 必须**整表放弃**并记进 over_budget，
+                # 绝不硬写。这条铁律是拿「游戏启动即死循环、窗口关不掉」换来的。
+                from gametl.extractors.base import wb_replaced as _wr1
+                for _u in _us:
+                    _u.translated = "【自检】超预算" + (_u.original or "")
+                _s2 = _ex.write_back(
+                    _P3(root=_td, engine=_ET3.BUDDHA, units=_us), _td / "out2")
+                rec(_s2.get("files_written", 0) == 0 and _wr1(_s2) == 0
+                    and bool(_s2.get("over_budget")),
+                    f"Buddha 合成：超预算整表放弃、记入 over_budget"
+                    f"（{_s2.get('over_budget')}）")
     except Exception as e:  # noqa: BLE001
         rec(False, f"Buddha 合成往返: {e}")
 
@@ -4507,15 +4527,20 @@ def _selfcheck():
             _bu = _bex.extract()
             rec(len(_bu) > 0, f"Buddha 真机提取 {len(_bu)} 条文本")
             if _bu:
-                _bhead = _bu[:200]
-                for _u in _bhead:
-                    _u.translated = "【自检】" + _u.original
+                # ★★ v2.6.3：真机通道同理 —— 伪翻译要**短于**原文，才既能
+                #    落地又不撞 `usize` 预算闸门（真实的 CQ2 里，给每条加
+                #    「【自检】」前缀会让英文表超预算 1634 字节，而那批表
+                #    没有全角标点可压缩 → 按契约整表放弃 → 断言假红）。
+                _bpick = [u for u in _bu
+                          if len((u.original or "").encode("utf-8")) >= 16][:80]
+                for _k, _u in enumerate(_bpick):
+                    _u.translated = "SELFTEST%02d" % _k
                 _bproj = _P4(root=Path(_bsample), engine=_ET4.BUDDHA,
-                             units=_bhead)
+                             units=_bpick)
                 _bs = _bex.write_back(_bproj, Path(_btd))
                 rec(_bs.get("files_written", 0) > 0,
                     f"Buddha 真机回填 {_bs.get('files_written')} 个文件"
-                    f"（{_wr2(_bs)} 处）")
+                    f"（{_wr2(_bs)} 处，候选 {len(_bpick)} 条）")
                 _bhit = 0
                 for _h in Path(_btd).rglob("*.~h"):
                     try:
@@ -4529,7 +4554,7 @@ def _selfcheck():
                             _t = _pp.read(_e).decode("utf-8", "ignore")
                         except Exception:  # noqa: BLE001
                             continue
-                        if "【自检】" in _t:
+                        if "SELFTEST" in _t:
                             _bhit += 1
                 rec(_bhit > 0, f"Buddha 真机回填后重新解包命中 {_bhit} 张表")
         except Exception as e:  # noqa: BLE001

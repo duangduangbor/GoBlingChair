@@ -57,7 +57,10 @@ def main() -> int:
         rec(unescape(raw) == want, f"unescape {raw!r}")
     rec(escape('a "b" \\ c') == 'a \\"b\\" \\\\ c', "escape 反斜杠与引号")
     rec(emit_value("Bye", False) == "Bye", "纯标识符保持裸写")
-    rec(emit_value("再见", False) == '"再见"', "中文自动加引号")
+    # ★ v2.6.3：判据是「裸写放不放得下」（`_BARE_BAD`），**不是**「是不是中文」。
+    # 中文/任何非 ASCII 都可以裸写，只有命中 `; " \ { } [ ] \r \n \t` 才退化成加引号。
+    rec(emit_value("再见", False) == "再见", "中文可裸写（v2.6.3 起按 _BARE_BAD 判据）")
+    rec(emit_value('说"你好"', False) == '"说\\"你好\\""', "含引号才加引号并转义")
     rec(emit_value('a;b', True) == '"a;b"', "含分号保留引号")
     rec(emit_value("Teddy", False) == "Teddy", "名字不加多余引号")
 
@@ -140,22 +143,26 @@ def main() -> int:
         rec(pk2.read(pk2.find("data/thing")) == blob,
             "就地替换：其它资源逐字节不变")
 
-        # ---- 8. 回填（译文超长 → 整包重建）----
+        # ---- 8. 回填（译文远超预算 → **整张表放弃、保原版**）----
+        #
+        # ★ v2.6.3 起这条契约反了过来。旧行为是「译文超长就整包重建、把新数据
+        #   排到数据区末尾」，而 CQ2 实测证明：只要资源的**解压后字节数**
+        #   超过原版，Buddha 引擎启动就死循环（CPU 空转、窗口关不掉）。
+        #   所以现在超预算的表一律不写 —— 宁可少翻一张，也不能让游戏起不来。
+        #   详见 extractors/buddha.py 里 _PUN_STAGES 上方的长注释。
         long_txt = "这是一段相当长的译文" * 40
         for u in units:
             u.translated = long_txt
         out2 = tmp / "out2"
-        ex.write_back(proj, out2)
-        pk3 = DfpfPack.open(out2 / "Test_Stuff.~h")
-        rec(len(pk3.entries) == 2, "重建后条目数不变")
-        rec(pk3.read(pk3.find("data/thing")) == blob,
-            "整包重建：其它资源逐字节不变")
-        oob = [e.name for e in pk3.entries
-               if e.offset + e.size > pk3.p_path.stat().st_size]
-        rec(not oob, "整包重建：没有越界的偏移")
-        t3 = pk3.read(pk3.find("stringtable/test_enus")).decode("utf-8")
-        rec(long_txt in t3, "整包重建：长译文落地")
-        rec(pk3.read(pk3.find("data/thing")) == blob, "整包重建：Blob 仍然可读")
+        st2 = ex.write_back(proj, out2)
+        rec(not (out2 / "Test_Stuff.~h").exists(),
+            "超预算 → 不产出该包（游戏保持原版，能正常启动）")
+        rec(any("test_enus" in s for s in st2.get("over_budget", [])),
+            "超预算的资源被记进 over_budget，能报给用户")
+        rec(st2.get("fields_replaced", 0) == 0, "超预算时一处都不替换")
+        rec(not (out2 / "Test_Stuff.~p").exists(), "连数据文件也不产出")
+        rec(pk.read(pk.find("stringtable/test_enus")) == stb,
+            "原表内容仍然完好")
 
     ok = sum(1 for o, _ in recs if o)
     total = len(recs)
