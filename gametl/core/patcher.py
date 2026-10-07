@@ -247,15 +247,28 @@ FP_MAX_NAMES = 12
 FP_INTERESTING_DIRS = ("www", "game", "renpy", "data", "js", "managed",
                        "streamingassets", "win", "packs", "resources")
 
-#: 采集指纹时要排除的文件名 —— 汉化工具自己会被用户丢进游戏目录，
-#: 要是它成了「共同特征」，两个毫不相干的游戏也会被判成「匹配」。
-FP_SKIP_NAMES = {"汉化安装器.exe", "滚刀哥布林汉化椅.exe", "gametl.exe"}
+FP_SKIP_NAMES = {"汉化安装器.exe", "滚刀哥布林汉化椅.exe", "gametl.exe",
+                 "goblingchair.exe"}
+
+
+def _is_tool_exe(name: str) -> bool:
+    """这个文件名是不是**本工具自己的 exe**。
+
+    版本号会变，所以除了精确名单，还要按前缀认：GitHub Release 上的资产名是
+    ``GoBlingChair-v2.6.3.exe`` 这种形式（**GitHub 不接受中文资产名**），
+    很多用户下载后不改名就直接丢进游戏目录。
+    大小写不敏感（Windows 上 ``Win``/``win`` 都能出现）。
+    """
+    low = (name or "").lower()
+    if low in FP_SKIP_NAMES:
+        return True
+    return low.startswith("goblingchair-v") and low.endswith(".exe")
 
 
 def _fp_names(paths) -> list[str]:
     out: list[str] = []
     for p in sorted(paths, key=lambda q: q.name.lower()):
-        if p.name in FP_SKIP_NAMES:
+        if _is_tool_exe(p.name):
             continue
         out.append(p.name)
         if len(out) >= FP_MAX_NAMES:

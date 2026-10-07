@@ -122,6 +122,12 @@ def test_locate(tmp: Path) -> None:
     (uni / "汉化安装器.exe").write_bytes(b"MZ")
     rec("汉化安装器.exe" not in patcher.game_fingerprint(uni).get("exe", []),
         "指纹排除汉化工具自己的 exe")
+    # GitHub Release 上的资产名是 GoBlingChair-v2.6.3.exe（GitHub 不收中文名），
+    # 用户常常不改名就丢进游戏目录 —— 按**前缀**也要认出来，且大小写不敏感
+    (uni / "GoBlingChair-v2.6.3.exe").write_bytes(b"MZ")
+    _fpe = patcher.game_fingerprint(uni).get("exe", [])
+    rec("GoBlingChair-v2.6.3.exe" not in _fpe,
+        "指纹排除 Release 资产名（带版本号前缀）")
 
     st = patcher.patch_status(game)
     rec(st["installed"] is False, "没装过 → installed=False")
