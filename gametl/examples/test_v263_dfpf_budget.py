@@ -8,7 +8,8 @@
    ``stringtable/costumequest_usenglish`` 原版 388657 —— 388649 能进、
    388666 卡死。中译必然撞线（英文 1 字符 ≈ 1 字节，中文 UTF-8 每字
    3 字节：字数 −23%、字节 +1.3%），所以回填必须自己压。
-   对策：三阶段全角标点 → 半角；仍超就**整张表放弃、保原版**。
+   对策两道闸：① 三阶段全角标点 → 半角；② 仍超就**逐条淘汰**（丢掉净增
+   字节最大的几条，其余照写），一条都塞不下才整张表保原版。
 
 2. **换行丢失**：``_clean`` 早期把 ``\\n`` 压成空格，CQ2 里 18 条多行文本
    （服装说明）整段挤成一行。
@@ -156,7 +157,7 @@ for good, orig in CLEAN:
 
 print()
 print("=" * 64)
-print("4. 预算不变量：落盘的 usize 永远 ≤ 原版；塞不下就不产出文件")
+print("4. 预算不变量：落盘的 usize 永远 ≤ 原版")
 print("=" * 64)
 
 viol: list = []
@@ -183,6 +184,51 @@ check(not viol, f"80 档长度扫描无违例（违例 {viol[:3]}）")
 check(bool(written_ok), f"有一批能成功写入（{len(written_ok)} 档，最大 k={max(written_ok)}）")
 check(bool(gave_up), f"有一批超预算被放弃（{len(gave_up)} 档，最小 k={min(gave_up)}）")
 check(max(written_ok) < min(gave_up), "分界清晰：能写的全部短于被放弃的")
+
+print()
+print("=" * 64)
+print("4b. 逐条淘汰：只有装不下的那几条保留英文，其余照写（v2.6.4）")
+print("=" * 64)
+
+_L1, _L2, _L3 = "A" * 200, "B" * 200, "C" * 200
+ST3 = (
+    'StringTable{LineCodeData={'
+    'T1=LineCodeData{Text="' + _L1 + '";VolumeDB=0;Character=Text;SoundCue=;};'
+    'T2=LineCodeData{Text="' + _L2 + '";VolumeDB=0;Character=Text;SoundCue=;};'
+    'T3=LineCodeData{Text="' + _L3 + '";VolumeDB=0;Character=Text;SoundCue=;};'
+    '};}'
+)
+
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+    build_synthetic_v5(tmp / "Test_Stuff.~h", tmp / "Test_Stuff.~p", [
+        ("stringtable/test_enus", ST3.encode("utf-8"), 0, True),
+    ])
+    u0 = DfpfPack.open(tmp / "Test_Stuff.~h").find("stringtable/test_enus").usize
+    ex3 = BuddhaExtractor(tmp)
+    units3 = ex3.extract()
+    # 三条的"净增字节"刻意拉开：T1 最胀(+130)、T2 最省(−140)、T3 居中(+100)。
+    # 合计 +90 > 预算 → 只需丢掉 T1 一条即可落地。
+    plan = {"T1": 110, "T2": 20, "T3": 100}
+    for u in units3:
+        u.translated = "中" * plan[u.location["key"]]
+    proj3 = Project(root=tmp, engine=EngineType.BUDDHA, units=units3)
+    out3 = tmp / "out"
+    st3 = ex3.write_back(proj3, out3)
+
+    h3 = out3 / "Test_Stuff.~h"
+    check(h3.exists(), "整体仍产出（不再整张表放弃）")
+    check(not st3.get("over_budget"), "没有整表放弃")
+    check(bool(st3.get("trimmed")), f"记进 trimmed（{st3.get('trimmed')}）")
+
+    pk3 = DfpfPack.open(h3)
+    body = pk3.read(pk3.find("stringtable/test_enus")).decode("utf-8")
+    check(utf8_len(body) <= u0, f"落盘 {utf8_len(body)} 字节 ≤ 原版 {u0}")
+    check(_L1 in body, "胀得最凶的 T1 保留英文（被淘汰）")
+    check("中" * 20 in body, "省字节的 T2 保留中文")
+    check("中" * 100 in body, "居中且装得下的 T3 保留中文")
+    check(st3.get("fields_replaced") == 2,
+          f"只替换 2 处（实际 {st3.get('fields_replaced')}）")
 
 print()
 print("=" * 64)

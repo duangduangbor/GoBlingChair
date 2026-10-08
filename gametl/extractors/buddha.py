@@ -202,9 +202,14 @@ def canonical_value(text: str, original: str) -> str:
 # 上记录过同一现象 —— "adding bytes ... 10 bytes causes the game to
 # completely lock up"；同引擎（Buddha）、同症状。
 #
-# 对策：按阶段把**全角标点换成半角**（每个字符 3 字节 → 1 字节，省 2 字节），
-# 只压到刚好够用就停，尽量保住中文排版；实在压不进去就**整张表放弃、保原版**
-# —— 写坏了游戏直接起不来，宁可少翻一张表也不能让用户打不开游戏。
+# 对策（两道闸）：
+#  ① 按阶段把**全角标点换成半角**（每个字符 3 字节 → 1 字节，省 2 字节），
+#     只压到刚好够用就停，尽量保住中文排版。实测单这一项就能省 1 万字节左右。
+#  ② 仍然超 → **逐条淘汰**（``_trim_to_budget``）：丢掉"净增字节"最大的几条，
+#     其余照写。v2.6.4 起替代了原来的「一超就整张表放弃」—— 预算是按整张表
+#     算的，表内条目能互相补贴，为 1.3% 的差额扔掉 3000 条译文太亏。
+#     一条都塞不下时才保原版（写坏了游戏直接起不来，宁可少翻也不能让用户
+#     打不开游戏）。
 #
 #: 全角 → 半角。分阶段是为了"能不换就不换"：先动观感影响最小的符号，
 #: 最后才动逗号句号。
@@ -261,6 +266,50 @@ def emit_value(text: str, was_quoted: bool) -> str:
     if not was_quoted and not (_BARE_BAD & set(text)):
         return text
     return '"' + escape(text) + '"'
+
+
+def _trim_to_budget(entries: list[dict], plain: dict, text: str,
+                    budget: int) -> tuple[dict, set]:
+    """逐条淘汰：丢掉"净增字节"最大的几条，直到整表塞得进预算。
+
+    ★ v2.6.4 起替代原来的「一超就整张表放弃」。理由：预算是**按整张表**算的
+    （``usize`` 是这一个资源解压后的大小），所以表内条目**可以互相补贴** ——
+    这条译文短一点，就够那条长一点。实测 CQ2 的 ``costumequest_usenglish``
+    只超 1.3%（388657 → 393599，+4942 字节），为这点差额扔掉整张表 3000+
+    条的译文太亏；``ukenglish`` 那张更只超 1634 字节。
+
+    丢的顺序 = 净增字节**降序**：丢一条顶几条，**保留的中文条数最多**。
+    ``delta ≤ 0``（省字节或持平）的条目永远不丢 —— 丢掉它们总量反而更大。
+
+    Args:
+        entries: ``parse_entries`` 的解析结果（要用 ``raw`` 算原始字节）
+        plain: ``{下标: 纯文本译文}``
+        text: 原表整文本（算"不翻是多少字节"的基数）
+        budget: 目标上限（原版 ``usize``）
+
+    Returns:
+        ``(保留的 {下标: 纯文本}, 被丢弃的下标集合)``
+    """
+    delta: dict[int, int] = {}
+    for i, v in plain.items():
+        raw_new = emit_value(v, entries[i]["raw"].startswith('"'))
+        if raw_new == entries[i]["raw"]:
+            continue                     # 一字不动 → 对总账零贡献
+        delta[i] = utf8_len(raw_new) - utf8_len(entries[i]["raw"])
+
+    total = utf8_len(text) + sum(delta.values())
+    keep = dict(plain)
+    dropped: set = set()
+    if total > budget:
+        for i in sorted(delta, key=lambda k: delta[k], reverse=True):
+            if total <= budget:
+                break
+            if delta[i] <= 0:
+                break                    # 后面全是省字节的，再丢只会更糟
+            total -= delta[i]
+            dropped.add(i)
+            keep.pop(i, None)
+    return keep, dropped
 
 
 # ------------------------------------------------------------------ 解析
@@ -426,6 +475,7 @@ class BuddhaExtractor(BaseExtractor):
         written = replaced = unchanged = 0
         changed: list[str] = []
         over_budget: list[str] = []
+        trimmed: list[str] = []
         for rel_h, units in by_pack.items():
             src_h = self.decoded_dir / rel_h
             if not src_h.is_file():
@@ -506,11 +556,20 @@ class BuddhaExtractor(BaseExtractor):
                             if len(payload) <= budget:
                                 break
                     if budget and len(payload) > budget:
-                        # 压不进去 → **整张表放弃，保原版**。写坏了游戏直接
-                        # 起不来（实测"黑屏 + 窗口关不掉 + CPU 空转"），
-                        # 宁可少翻一张表也不能让用户打不开游戏。
-                        over_budget.append(f"{rel_h}::{res_name}")
-                        continue
+                        # 压标点还不够 → **逐条淘汰**，而不是整张表放弃。
+                        # 预算按整张表算，表内条目能互相补贴，所以只有真正
+                        # 装不下的那几条保留英文。全被丢掉时等价于「保原版」。
+                        kept, dropped = _trim_to_budget(
+                            entries, new_values, text, budget)
+                        new_text, n = _assemble(kept)
+                        payload = new_text.encode("utf-8")
+                        if not n or len(payload) > budget:
+                            # 一条都塞不下（或算术与实际不符）→ 保原版。
+                            # 写坏了游戏直接起不来（实测「黑屏 + 窗口关不掉 +
+                            # CPU 空转」），宁可少翻也不能让用户打不开游戏。
+                            over_budget.append(f"{rel_h}::{res_name}")
+                            continue
+                        trimmed.append(f"{rel_h}::{res_name}::{len(dropped)}")
 
                     changes[ent] = payload
                     n_here += n
@@ -536,7 +595,7 @@ class BuddhaExtractor(BaseExtractor):
 
         return wb_stats(files_written=written, replaced=replaced,
                         unchanged=unchanged, changed=changed,
-                        over_budget=over_budget)
+                        over_budget=over_budget, trimmed=trimmed)
 
 
 # 延后绑定引擎枚举，避免 models → extractors 的循环引用

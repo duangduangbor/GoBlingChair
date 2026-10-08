@@ -86,7 +86,7 @@ SASH_RETRY_MAX = 30
 
 APP_NAME = "滚刀哥布林汉化椅"
 APP_NAME_EN = "GoBlingChair"
-APP_VERSION = "2.6.3"
+APP_VERSION = "2.6.4"
 INSTALLER_NAME = "汉化安装器.exe"
 
 
@@ -4499,17 +4499,39 @@ def _selfcheck():
                     "Buddha 合成回填：重新解包命中")
                 rec(_pk2.read(_pk2.find("data/blob")) == bytes(range(256)),
                     "Buddha 合成回填：其它资源零误伤")
-                # 反向：译文严重超预算 → 必须**整表放弃**并记进 over_budget，
-                # 绝不硬写。这条铁律是拿「游戏启动即死循环、窗口关不掉」换来的。
                 from gametl.extractors.base import wb_replaced as _wr1
+                # ★ v2.6.4：压完标点仍超预算 → **逐条淘汰**（丢掉净增字节最大
+                #   的那几条，其余照写），不再把整张表一起扔掉。合成包的
+                #   usize == 原表长度（零余量），所以能精确造出「K1 胀 55 字节、
+                #   K2 省 22 字节、合计超 33 字节」—— 只需丢 K1 一条即可落地。
                 for _u in _us:
-                    _u.translated = "【自检】超预算" + (_u.original or "")
+                    if _u.location.get("key") == "K1":
+                        _u.translated = "中" * 20          # delta ≈ +55
+                    else:
+                        _u.translated = "按"               # delta ≈ −22
                 _s2 = _ex.write_back(
                     _P3(root=_td, engine=_ET3.BUDDHA, units=_us), _td / "out2")
-                rec(_s2.get("files_written", 0) == 0 and _wr1(_s2) == 0
-                    and bool(_s2.get("over_budget")),
-                    f"Buddha 合成：超预算整表放弃、记入 over_budget"
-                    f"（{_s2.get('over_budget')}）")
+                _pk3 = _DP.open((_td / "out2") / "S.~h")
+                _txt3 = _pk3.read(_pk3.find("stringtable/enus")).decode("utf-8")
+                rec(_s2.get("files_written", 0) > 0 and bool(_s2.get("trimmed"))
+                    and _wr1(_s2) == 1,
+                    f"Buddha 合成：超预算 → 只丢装不下的 1 条、其余照写"
+                    f"（trimmed={_s2.get('trimmed')}）")
+                rec('"Hello"' in _txt3 and '"按"' in _txt3,
+                    "Buddha 合成：被丢的保留英文、留下的落地中文")
+                rec(len(_txt3.encode("utf-8"))
+                    <= _pk.find("stringtable/enus").usize,
+                    "Buddha 合成：逐条淘汰后仍满足 usize 预算")
+                # 反向铁律：**一条都塞不下**时必须保原版、绝不硬写 ——
+                # 这条是拿「游戏启动即死循环、窗口关不掉」换来的。
+                for _u in _us:
+                    _u.translated = "【自检】超预算" + (_u.original or "")
+                _s3 = _ex.write_back(
+                    _P3(root=_td, engine=_ET3.BUDDHA, units=_us), _td / "out3")
+                rec(_s3.get("files_written", 0) == 0 and _wr1(_s3) == 0
+                    and bool(_s3.get("over_budget")),
+                    f"Buddha 合成：全塞不下 → 整表保原版、记入 over_budget"
+                    f"（{_s3.get('over_budget')}）")
     except Exception as e:  # noqa: BLE001
         rec(False, f"Buddha 合成往返: {e}")
 
