@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import ast
 import json
 import shutil
 import sys
@@ -234,6 +235,86 @@ def main() -> int:
               "撤的只是界面上那排按钮：开机自动探测 + 逐个位置试扫必须留着，"
               "否则打开软件是一张空表")
 
+        # ---- 9e) v2.6.5 修：同一页不许有两颗同功能按钮 ----
+        # 用户的反馈原话：「同功能按钮同一页面不要重复」。
+        # 实际情况确实离谱 —— 游戏库页上同时长着
+        #   ①「🔍 扫描游戏」和「🔄 重新扫描」  → 都调 self.lib_scan
+        #   ②「▶ 汉化这个游戏」和底部那条「▶ 开始汉化」→ 都是"汉化这个游戏"
+        # 而②尤其糟：两颗按钮走的**不是同一条路**（lib_apply 有现成翻译包就直接
+        # 装、几秒完事；start 只会老老实实跑模型），点哪颗结果都不一样。
+        # 现在：扫描按钮删掉一颗；底部操作栏整条搬进第 2 页，不再横跨两个页签。
+        #
+        # 下面这条是**通用**守卫（不是钉某一个按钮名）：AST 扫全文件，在**同一个
+        # 函数体内**（= 同一页/同一块界面），如果两颗 Button 的 command 完全一样，
+        # 直接失败。以后再加重复按钮一样跑不掉。
+        _t = ast.parse(gui_src, filename="gui.py")
+        _cls = next((n for n in _t.body
+                     if isinstance(n, ast.ClassDef) and n.name == "App"), None)
+        check(_cls is not None, "gui.py 里找不到 class App")
+
+        def _cmd_key(node):
+            """把 command= 的表达式压成一个可比较的字符串。
+
+            ⚠️ 不能用 ast.unparse —— 那是 Python 3.9+ 才有的，而这个测试
+            要跟着打包用的 3.8 一起跑（3.8 里根本没有这个属性，会 AttributeError）。
+            `ast.dump` 从 3.0 就有，且对同一段源码给出同样的字符串，够用。
+            `self.xxx` 这种最常见的形式顺手写成短名，失败信息看得懂。
+            """
+            if (isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "self"):
+                return f"self.{node.attr}"
+            return ast.dump(node)
+
+        def _btn_commands(fn_node):
+            out = []
+            for sub in ast.walk(fn_node):
+                if not isinstance(sub, ast.Call):
+                    continue
+                f = sub.func
+                if not (isinstance(f, ast.Attribute) and f.attr == "Button"):
+                    continue
+                for kw in sub.keywords:
+                    if kw.arg == "command":
+                        out.append((sub.lineno, _cmd_key(kw.value)))
+            return out
+
+        if _cls is not None:
+            for fn_name in ("__init__", "_build_library_page"):
+                _fn = next((n for n in _cls.body
+                            if isinstance(n, ast.FunctionDef)
+                            and n.name == fn_name), None)
+                check(_fn is not None, f"gui.py 里找不到 {fn_name}")
+                if _fn is None:
+                    continue
+                _seen: dict = {}
+                _dups = []
+                for _line, _cmd in _btn_commands(_fn):
+                    if _cmd in _seen:
+                        _dups.append(
+                            f"{_cmd}（第 {_seen[_cmd]} 行 / 第 {_line} 行）")
+                    else:
+                        _seen[_cmd] = _line
+                check(not _dups,
+                      f"{fn_name} 里有两颗按钮干同一件事：{_dups}"
+                      "（同一页面不要重复同功能按钮）")
+
+        check("self.lib_rescan_btn" not in gui_src,
+              "「🔄 重新扫描」要删掉 —— 它和「🔍 扫描游戏」都调 lib_scan，"
+              "同一页两颗同功能按钮")
+        # 底部操作栏必须搬进第 2 页，否则它会在两个页签底下都出现
+        check("bar = ttk.Frame(adv_page)" in gui_src,
+              "底部操作栏（开始汉化/取消/打开输出目录）要挂在 adv_page 里，"
+              "不能再挂在最外层框架上 —— 挂外层等于两个页签都看得见，"
+              "游戏库页就会同时出现「汉化这个游戏」和「开始汉化」两颗按钮")
+        _bseg = gui_src[gui_src.index("bar = ttk.Frame(adv_page)"):]
+        _bseg = _bseg[: _bseg.find("ttk.PanedWindow")]
+        check('bar.pack(side="bottom"' in _bseg,
+              "底部操作栏要先 side=\"bottom\" pack，把高度占住再放分栏")
+        check("self.start_btn" in _bseg and "self.cancel_btn" in _bseg
+              and "self.open_out_btn" in _bseg,
+              "三颗底部按钮都要在 adv_page 里建")
+
         # ---- 10) library 不许反向依赖 gui（会成环） ----
         lib_src = (ROOT / "gametl" / "core" / "library.py").read_text(
             encoding="utf-8")
@@ -251,7 +332,6 @@ def main() -> int:
         # App.__new__ 手工搭界面、绕过了 __init__，所以没拦住。
         # 这里用 AST 把整份 gui.py 扫一遍：凡是 self.X 既不是方法、
         # 也没在任何地方 `self.X = ...` 赋值过，就是悬空引用。
-        import ast
         tree = ast.parse(gui_src, filename="gui.py")
         app = next((n for n in tree.body
                     if isinstance(n, ast.ClassDef) and n.name == "App"), None)

@@ -183,6 +183,12 @@ def test_real_window() -> None:
     rec(right >= min(SASH_MIN_RIGHT, pane_w), f"右栏 {right} ≥ {SASH_MIN_RIGHT}")
     rec(app._sash_locked, "落位成功后锁定，不再和用户抢分隔条")
 
+    # v2.6.5：底部操作栏（开始汉化 / 取消 / 打开输出目录）属于这一页。
+    # 它以前挂在最外层框架上 → 两个页签底下都看得见 → 游戏库页同时出现
+    # 「汉化这个游戏」和「开始汉化」两颗按钮，而两颗走的还不是同一条路。
+    rec(app.start_btn.winfo_ismapped(),
+        "「📊 进度与设置」页看得见底部的「▶ 开始汉化」")
+
     # 卡片不能被切：正文容器的自然宽度要装得进左栏
     body_need = app.settings.body.winfo_reqwidth()
     rec(body_need <= left,
@@ -286,6 +292,18 @@ def test_library_fits_small_window() -> None:
     rec(app.lib_tree.winfo_height() > 40,
         f"表格仍然给得出高度（h={app.lib_tree.winfo_height()}）——"
         "被挤的应该是它，不是按钮")
+
+    # v2.6.5：游戏库页**不该**看得见底部那条「▶ 开始汉化」。
+    # 曾经它挂在外层框架上，于是这一页同时有两颗"汉化这个游戏"：
+    # 「▶ 汉化这个游戏」（lib_apply：有现成包就直接装）和「▶ 开始汉化」
+    # （start：只会跑模型）—— 点哪颗结果都不一样，用户被搞懵。
+    # 用户的要求原话：「同功能按钮同一页面不要重复」。
+    rec(not app.start_btn.winfo_ismapped(),
+        f"游戏库页看不到底部的「▶ 开始汉化」"
+        f"（mapped={int(app.start_btn.winfo_ismapped())}）——"
+        "它已经搬进第 2 页，不能再和「汉化这个游戏」挤在同一页")
+    rec(app.lib_apply_btn.winfo_ismapped(),
+        "游戏库页的「▶ 汉化这个游戏」在（这一页的汉化入口只剩它一颗）")
 
     app.on_close()
 

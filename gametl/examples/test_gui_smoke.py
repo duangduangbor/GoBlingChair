@@ -149,9 +149,9 @@ def main() -> int:
         traceback.print_exc()
         FAILED.append("_refresh_repo 抛异常")
 
-    # 没选游戏 + 没选包 → 「汉化到所选游戏」必须是禁用态
+    # 没选游戏 + 没选包 → 「安装到所选游戏」必须是禁用态
     if str(app.pkg_apply_btn.cget("state")) != "disabled":
-        FAILED.append("没选游戏时「汉化到所选游戏」应为禁用")
+        FAILED.append("没选游戏时「安装到所选游戏」应为禁用")
     if str(app.pkg_revert_btn.cget("state")) != "disabled":
         FAILED.append("没装汉化时「还原原版」应为禁用")
     # 这两个不该依赖游戏/包，永远可用
@@ -164,9 +164,13 @@ def main() -> int:
     for attr in ("lib_tree", "lib_root_entry", "lib_scan_btn",
                  "lib_choose_btn", "lib_apply_btn", "lib_revert_btn",
                  "lib_open_btn", "lib_summary", "lib_status", "lib_progress",
-                 "lib_detail", "lib_rescan_btn", "nb"):
+                 "lib_detail", "nb"):
         if not hasattr(app, attr):
             FAILED.append(f"缺少游戏库控件 {attr}")
+    # v2.6.5：同一页不许有两颗同功能按钮。「🔄 重新扫描」曾经跟「🔍 扫描游戏」
+    # 都调 lib_scan，已删 —— 谁再加回来，这条立刻红。
+    if hasattr(app, "lib_rescan_btn"):
+        FAILED.append("lib_rescan_btn 应当删掉（跟「🔍 扫描游戏」是同一件事）")
     if not hasattr(app, "_lib_entries"):
         FAILED.append("缺少 _lib_entries")
     # 默认停在第 1 页（游戏库）—— 傻瓜式的前提

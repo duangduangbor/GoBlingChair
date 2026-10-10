@@ -27,14 +27,23 @@
     │  │ └────────┴────────┴────────┴────────────────┘    │
     │  │ 扫到 12 个游戏 · 3 个可一键汉化 · 2 个已汉化      │
     │  │ 正在翻译… 1234/13435  ████████░░░░░░░░░░░░░░      │
-    │  │ [▶ 汉化这个游戏] [↩ 还原] [📂 打开] [🔄 重扫]     │
+    │  │ [▶ 汉化这个游戏] [↩ 还原原版] [📂 打开文件夹]     │
     │  └──────────────────────────────────────────────────┘
     └────────────────────────────────────────────────────┘
 
 ⚠️ 卡片下半部（进度 / 状态 / 按钮那一排）是**从下往上 pack 的**，不是从上往下 ——
    窗口一矮，pack 会从最后 pack 的那个开始把控件挤成 0 高。实测 1080×756 时
-   「▶ 汉化这个游戏」整排 h=1 / mapped=0（屏幕上一个像素都没有），用户根本点不到，
-   只能去点底部那条「▶ 开始汉化」。所以底排必须先把高度占住，让表格去挤。
+   「▶ 汉化这个游戏」整排 h=1 / mapped=0（屏幕上一个像素都没有），用户根本点不到。
+   所以底排必须先把高度占住，让表格去挤。
+
+★★ **同一个页面上不许有两颗干同一件事的按钮。** 这一页（游戏库）只有三颗动词按钮：
+   扫描 / 汉化 / 还原，各一颗。曾经这里有两颗「扫描」（[🔍 扫描游戏] 和表格头上的
+   [🔄 重新扫描]，都调 `lib_scan`），页面外面那条底部操作栏又摆了一颗「▶ 开始汉化」
+   压在下面，于是用户在游戏库页看到**两颗绿色的汉化按钮** —— 一颗会智能路由
+   （`lib_apply`：有现成包就直接装），一颗只会跑模型（`start`），点哪颗结果不一样。
+   现在底部操作栏整条搬进第 2 页，第 1 页只剩自己那几颗。
+   守卫见 `test_v260_library.py` 第 9e 节（AST 扫「同一个函数里同一 command 出现两次」）
+   + `test_v17_layout_gui.py` 第 [5] 节（真开窗口量：第 1 页不该看得见 [▶ 开始汉化]）。
 
 第二页（左设置 / 右进度+日志，中间分隔条可拖）::
 
@@ -46,7 +55,12 @@
     │ │ 🌐 目标语言   │ │ │ │ [OK] 已提取 13435 条      │ │ │
     │ │ 📦 一键汉化   │ │ │ │ [OK] 正在翻译 ...         │ │ │
     │ └───────────────┘ │ └──────────────────────────────┘ │
+    │ [▶ 开始汉化] [取消]                [打开输出目录]     │
     └────────────────────────────────────────────────────┘
+
+    底部操作栏（开始汉化 / 取消 / 打开输出目录）只属于**这一页** ——
+    它本来就该长在进度和日志底下，而不是横跨两个页签，跑去跟游戏库那颗
+    「汉化这个游戏」打架。
 """
 from __future__ import annotations
 
@@ -567,11 +581,32 @@ class App:
             wraplength=560)
         self.engine_label.pack(side="right", anchor="ne", pady=(4, 0))
 
-        # ---- 底部操作栏 ----
-        # 先 pack side="bottom"：主按钮和进度条**永远**留在窗口底部，
-        # 不管上面塞了多少卡片都不会把它顶出可视区。
-        bar = ttk.Frame(r)
-        bar.pack(side="bottom", fill="x", padx=18, pady=(0, 14))
+        # ---- 中间：Notebook（游戏库 = 主入口 / 进度与设置 = 全部细节） ----
+        # 傻瓜式：默认停在「游戏库」，普通用户永远不用切到第二页。
+        # 但**点了汉化就必须切过去** —— 进度和日志都在那一页，不切的话
+        # 用户在游戏库点完什么都看不见，会以为按钮没生效（见 _goto_progress）。
+        nb = ttk.Notebook(r)
+        nb.pack(fill="both", expand=True, padx=18, pady=(10, 4))
+        self.nb = nb
+
+        lib_page = ttk.Frame(nb)
+        nb.add(lib_page, text="  🎮 游戏库  ")
+        adv_page = ttk.Frame(nb)
+        nb.add(adv_page, text=ADV_TAB_TEXT)
+        self._lib_page = lib_page
+        self._adv_page = adv_page
+        self._build_library_page(lib_page)
+
+        # ---- 底部操作栏（★ 属于「进度与设置」这一页，不横跨两页） ----
+        # 它以前挂在窗口最外层，于是**两个页签底下都看得见**：第 1 页（游戏库）
+        # 本来就有自己的「▶ 汉化这个游戏」，再压一颗「▶ 开始汉化」= 同一页两颗
+        # 汉化按钮，而且两颗走的不是同一条路（lib_apply 会优先用现成翻译包，
+        # start 只会跑模型）—— 用户点哪颗结果都不一样，这是真事故。
+        # 搬进来之后：游戏库页只有自己那几颗，这一页（进度 + 日志）配这一条，
+        # 取消 / 打开输出目录 也都落在进度旁边，位置本来就该在这儿。
+        # pack 顺序：side="bottom" 先占住底部，分栏再 fill 剩下的。
+        bar = ttk.Frame(adv_page)
+        bar.pack(side="bottom", fill="x", padx=18, pady=(10, 14))
 
         self.start_btn = tk.Button(
             bar, text="▶  开始汉化", command=self.start,
@@ -595,22 +630,6 @@ class App:
             font=("Microsoft YaHei UI", 10), padx=14, pady=9,
             state="disabled")
         self.open_out_btn.pack(side="right")
-
-        # ---- 中间：Notebook（游戏库 = 主入口 / 进度与设置 = 全部细节） ----
-        # 傻瓜式：默认停在「游戏库」，普通用户永远不用切到第二页。
-        # 但**点了汉化就必须切过去** —— 进度和日志都在那一页，不切的话
-        # 用户在游戏库点完什么都看不见，会以为按钮没生效（见 _goto_progress）。
-        nb = ttk.Notebook(r)
-        nb.pack(fill="both", expand=True, padx=18, pady=(10, 4))
-        self.nb = nb
-
-        lib_page = ttk.Frame(nb)
-        nb.add(lib_page, text="  🎮 游戏库  ")
-        adv_page = ttk.Frame(nb)
-        nb.add(adv_page, text=ADV_TAB_TEXT)
-        self._lib_page = lib_page
-        self._adv_page = adv_page
-        self._build_library_page(lib_page)
 
         # ---- 进度与设置：原来的左右分栏（左设置 / 右日志，可拖动） ----
         # 两栏都给非 0 权重：这是「打开就只见日志、设置区得手动拖出来」
@@ -899,8 +918,15 @@ class App:
 
         r45a = tk.Frame(inner45, bg=CARD)
         r45a.pack(fill="x", pady=(8, 0))
+        # 文案是「安装到所选游戏」而不是「汉化到所选游戏」：这一页底部那条
+        # 主按钮叫「▶ 开始汉化」，两颗都写「汉化…」会让人以为是一件事的
+        # 两个入口。实际上完全是两条路 ——
+        #   ▶ 开始汉化        = 调用本机模型，从头把游戏翻出来（要等）
+        #   ✔ 安装到所选游戏  = 把上面列表里选中的 .gtpkg 直接装进去（几秒）
+        # 卡片标题已经写明「一键汉化（用现成翻译包，免模型）」，按钮说「安装」
+        # 正好接得上，也不会跟主按钮抢同一个动词。
         self.pkg_apply_btn = tk.Button(
-            r45a, text="✔ 汉化到所选游戏", command=self.apply_package_to_game,
+            r45a, text="✔ 安装到所选游戏", command=self.apply_package_to_game,
             bg="#dcfce7", fg="#166534", activebackground="#bbf7d0",
             relief="flat", cursor="hand2",
             font=("Microsoft YaHei UI", 10, "bold"), padx=14, pady=8,
@@ -1077,12 +1103,10 @@ class App:
             head_row, text="还没有扫描。", bg=CARD, fg=TEXT,
             font=("Microsoft YaHei UI", 10, "bold"), anchor="w")
         self.lib_summary.pack(side="left")
-        self.lib_rescan_btn = tk.Button(
-            head_row, text="🔄 重新扫描", command=self.lib_scan,
-            bg=IDLE_BTN, fg=TEXT, activebackground=IDLE_BTN_HOVER,
-            relief="flat", cursor="hand2",
-            font=("Microsoft YaHei UI", 9), padx=10, pady=3)
-        self.lib_rescan_btn.pack(side="right")
+        # 这里曾经还有一颗「🔄 重新扫描」，command 同样是 self.lib_scan ——
+        # 跟上面「位置」卡片里的「🔍 扫描游戏」一模一样，同一页两颗同功能按钮。
+        # 已删掉：想再扫一次就点那颗「🔍 扫描游戏」，它一直在，位置也更好找
+        # （就在输入框旁边）。要扫别的目录，改一下输入框再点同一颗即可。
 
         style = ttk.Style()
         style.configure("Lib.Treeview",
@@ -1429,8 +1453,9 @@ class App:
         self._lib_refresh_buttons()
 
     def _lib_set_buttons(self, *, scanning: bool) -> None:
+        # 注意：这里只有**一颗**扫描按钮了（`lib_rescan_btn` 已删，
+        # 同一页不许有两颗都调 lib_scan 的按钮）。
         for name, on in (("lib_scan_btn", not scanning),
-                         ("lib_rescan_btn", not scanning),
                          ("lib_choose_btn", not scanning)):
             b = getattr(self, name, None)
             if b is None:
@@ -3740,6 +3765,16 @@ def _boot_test() -> int:
             f"_goto_progress 把界面切到第 2 页（当前第 "
             f"{int(app.nb.index('current')) + 1} 页）")
         app.nb.select(0)
+
+        # v2.6.5：底部操作栏必须长在第 2 页里。它以前挂在最外层框架 → 两个
+        # 页签底下都看得见 → 游戏库页同时出现「汉化这个游戏」和「开始汉化」
+        # 两颗按钮（而且走的不是同一条路）。窗口 withdraw 期间量不了
+        # winfo_ismapped，所以这里查**父子关系**。
+        _adv_path = str(app._adv_page)
+        _btn_up = str(app.start_btn.winfo_parent())
+        rec(_btn_up.startswith(_adv_path),
+            f"「▶ 开始汉化」挂在第 2 页里（{_btn_up} ⊂ {_adv_path}）"
+            " —— 不能再横跨两个页签")
 
         try:
             app.on_close()
