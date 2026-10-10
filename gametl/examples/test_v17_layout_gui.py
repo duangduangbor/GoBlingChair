@@ -159,6 +159,18 @@ def test_real_window() -> None:
 
     pump(1.5)                                # 让窗口完成映射与落位
 
+    # ⚠️ 必须先切到分栏所在的那一页，否则量的是空气。
+    #    分栏从 v2.6.0 起搬进了 Notebook 的第 2 页（当时叫「高级设置」，
+    #    v2.6.5 起叫「📊 进度与设置」），而默认停在「🎮 游戏库」。
+    #    **没被选中的 Notebook 页是未映射的 —— 控件的 winfo_width() 恒为 1。**
+    #    这个测试从那一刻起就没再量到过真东西，偏偏它又没被 _runall.ps1 收进去，
+    #    于是烂了很久没人发现（实测：不切页 → pane 宽 1px；切过去 → 1140px）。
+    app.nb.select(1)
+    pump(0.6)
+
+    rec(app._pane.winfo_ismapped(),
+        "第 2 页的分栏已被映射（不是量一个没显示的控件）")
+
     pane_w = app._pane.winfo_width()
     sash = app._pane.sashpos(0)
     left = app.settings.winfo_width()
@@ -210,6 +222,12 @@ def test_real_window() -> None:
     while time.time() - t0 < 1.2:
         root2.update()
         time.sleep(0.02)
+    # 同上：分栏在第 2 页，得先切过去才量得到
+    app2.nb.select(1)
+    t0 = time.time()
+    while time.time() - t0 < 0.6:
+        root2.update()
+        time.sleep(0.02)
     rec(app2._sash_saved is not None,
         f"第二次打开读到了上次的位置（{app2._sash_saved}）")
     rec(abs(app2._pane.sashpos(0) - app2._sash_saved) <= 2,
@@ -234,4 +252,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    code = main()
+    sys.stdout.flush()
+    # tkinter 退出后解释器有时不肯收尾（残留的 after 回调 / Tcl 异步处理器），
+    # 表现为「结果明明是 0 失败，退出码却是 1」——批量回归会把它误判成失败。
+    # 和 test_v17_installer_gui 一样，直接送走。
+    os._exit(code)

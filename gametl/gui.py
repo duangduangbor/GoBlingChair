@@ -5,14 +5,20 @@
 软件自己扫、自己判断，把扫到的游戏列成一张表（游戏 / 状态 / 类型 / 位置），
 用户点一行、点一下「汉化这个游戏」就行。
 
-引擎、模型、性能档位、翻译包、术语表这些**内部概念全部收进「高级设置」页**，
+引擎、模型、性能档位、翻译包、术语表这些**内部概念全部收进「📊 进度与设置」页**，
 默认看不见 —— 不关心的人一辈子不用点进去。
+
+三件事各占一个位置，都在第一眼：
+
+* **进来** → 停在「🎮 游戏库」，第一屏就是「游戏装在哪个盘 / 文件夹」+ [扫描]
+* **点汉化** → 自动切到「📊 进度与设置」（右栏大进度条 + 运行日志立刻可见）
+* **点设置** → 同一个页签，左栏**第一张卡片就是「翻译模型」**
 
 界面布局::
 
     ┌────────────────────────────────────────────────────┐
     │  🎮 滚刀哥布林汉化椅          🟢 翻译引擎就绪        │
-    │  ┌ 游戏库 ─┐┌ 高级设置 ─┐                            │
+    │  ┌ 🎮 游戏库 ─┐┌ 📊 进度与设置 ─┐                   │
     │  │ 游戏装在哪儿？[D:\\SteamLibrary\\...] [选择] [扫描] │
     │  │ ┌────────┬────────┬────────┬────────────────┐    │
     │  │ │ 游戏   │ 状态   │ 类型   │ 位置           │    │
@@ -22,6 +28,18 @@
     │  │ [▶ 汉化这个游戏] [↩ 还原] [📂 打开] [🔄 重扫]     │
     │  │ 扫到 12 个游戏 · 3 个可一键汉化 · 2 个已汉化      │
     │  └──────────────────────────────────────────────────┘
+    └────────────────────────────────────────────────────┘
+
+第二页（左设置 / 右进度+日志，中间分隔条可拖）::
+
+    ┌ 📊 进度与设置 ─────────────────────────────────────┐
+    │ ┌ 设置 ────────┐ │ ┌ 进度 ────────────────────────┐ │
+    │ │ 🧠 翻译模型   │ │ │ 正在翻译... 1234/13435  8.5/s│ │
+    │ │ 🚀 性能档位   │ │ │ ████████████░░░░░░░░░░░░░░░  │ │
+    │ │ 🎮 游戏文件夹 │ │ │ ┌ 运行日志 ────────────────┐ │ │
+    │ │ 🌐 目标语言   │ │ │ │ [OK] 已提取 13435 条      │ │ │
+    │ │ 📦 一键汉化   │ │ │ │ [OK] 正在翻译 ...         │ │ │
+    │ └───────────────┘ │ └──────────────────────────────┘ │
     └────────────────────────────────────────────────────┘
 """
 from __future__ import annotations
@@ -86,8 +104,16 @@ SASH_RETRY_MAX = 30
 
 APP_NAME = "滚刀哥布林汉化椅"
 APP_NAME_EN = "GoBlingChair"
-APP_VERSION = "2.6.4"
+APP_VERSION = "2.6.5"
 INSTALLER_NAME = "汉化安装器.exe"
+
+#: 第 2 个页签的标题。**单一来源** —— 界面上凡是让用户「去那一页看看」的
+#: 提示文案都拼接这个常量，改名时不会漏掉某一处还把用户指错地方。
+#: 叫「进度与设置」而不是「高级设置」：用户点完汉化会被自动切到这里看进度，
+#: 一个叫「高级设置」的页签会让人觉得"我是不是点错进了什么危险的地方"。
+ADV_TAB_TEXT = "  📊 进度与设置  "
+#: 给文案用的短名（不带两侧留白），例：`在「进度与设置」里手动选它试试`
+ADV_TAB_NAME = ADV_TAB_TEXT.strip()
 
 
 def safe_work_name(game_dir) -> str:
@@ -564,8 +590,10 @@ class App:
             state="disabled")
         self.open_out_btn.pack(side="right")
 
-        # ---- 中间：Notebook（游戏库 = 主入口 / 高级设置 = 全部细节） ----
+        # ---- 中间：Notebook（游戏库 = 主入口 / 进度与设置 = 全部细节） ----
         # 傻瓜式：默认停在「游戏库」，普通用户永远不用切到第二页。
+        # 但**点了汉化就必须切过去** —— 进度和日志都在那一页，不切的话
+        # 用户在游戏库点完什么都看不见，会以为按钮没生效（见 _goto_progress）。
         nb = ttk.Notebook(r)
         nb.pack(fill="both", expand=True, padx=18, pady=(10, 4))
         self.nb = nb
@@ -573,12 +601,12 @@ class App:
         lib_page = ttk.Frame(nb)
         nb.add(lib_page, text="  🎮 游戏库  ")
         adv_page = ttk.Frame(nb)
-        nb.add(adv_page, text="  ⚙ 高级设置  ")
+        nb.add(adv_page, text=ADV_TAB_TEXT)
         self._lib_page = lib_page
         self._adv_page = adv_page
         self._build_library_page(lib_page)
 
-        # ---- 高级设置：原来的左右分栏（左设置 / 右日志，可拖动） ----
+        # ---- 进度与设置：原来的左右分栏（左设置 / 右日志，可拖动） ----
         # 两栏都给非 0 权重：这是「打开就只见日志、设置区得手动拖出来」
         # 的根治办法（见文件头 PANE_WEIGHT_LEFT 的注释）。
         pane = ttk.PanedWindow(adv_page, orient="horizontal")
@@ -591,7 +619,78 @@ class App:
         self.settings.pack(fill="both", expand=True)
         col = self.settings.body
 
-        # ---- 卡片 1：游戏文件夹 ----
+        # 左栏卡片的顺序**按「用户多久改一次」排**，不是按重要性 ——
+        # 用户点进这一页十有八九是来换模型的（跑太慢 / 嫌质量差），
+        # 所以「翻译模型」必须是第一眼就看得见的第一张卡片，不用滚动。
+        #
+        #   ① 翻译模型 → ② 性能档位 → ③ 游戏文件夹（手动兜底）→ ④ 目标语言
+        #   → ⑤ 术语表(自动) → ⑥ 校对与交付 → ⑦ 一键汉化 → ⑧ 运行时翻译
+
+        # ---- 卡片 1：翻译模型（与档位解耦，可单独选） ----
+        card3 = tk.Frame(col, bg=CARD, highlightbackground="#e5e7eb",
+                         highlightthickness=1)
+        card3.pack(fill="x", pady=(0, 8))
+        inner3 = tk.Frame(card3, bg=CARD)
+        inner3.pack(fill="x", padx=16, pady=12)
+
+        tk.Label(inner3, text="翻译模型", bg=CARD, fg=MUTED,
+                 font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+
+        self._model_btns: dict = {}
+        self.model_row = ButtonRow(inner3, bg=CARD)
+        self.model_row.pack(fill="x", pady=(6, 0))
+
+        self.model_detail = tk.Label(
+            inner3, text="", bg=CARD, fg=MUTED,
+            font=("Microsoft YaHei UI", 9), anchor="w", justify="left")
+        self.model_detail.pack(fill="x", pady=(8, 0))
+        wrap_to_parent(self.model_detail, inner3)
+        self._build_model_buttons()
+
+        # 自定义模型：从任意位置选一个 .gguf 复制进 models\
+        self.pick_model_btn = tk.Button(
+            inner3, text="📂 选择模型文件…", command=self.pick_model_file,
+            bg="#f3f4f6", fg="#374151", activebackground="#e5e7eb",
+            relief="flat", cursor="hand2",
+            font=("Microsoft YaHei UI", 9), padx=12, pady=6)
+        self.pick_model_btn.pack(fill="x", pady=(8, 0))
+
+        # ---- 卡片 2：性能档位 ----
+        card2 = tk.Frame(col, bg=CARD, highlightbackground="#e5e7eb",
+                         highlightthickness=1)
+        card2.pack(fill="x", pady=(0, 8))
+        inner2 = tk.Frame(card2, bg=CARD)
+        inner2.pack(fill="x", padx=16, pady=12)
+
+        tk.Label(inner2, text="性能档位", bg=CARD, fg=MUTED,
+                 font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+
+        self.profile_var = tk.StringVar(value="turbo")
+        self._profile_btns: dict = {}
+        p_row = ButtonRow(inner2, bg=CARD)
+        p_row.pack(fill="x", pady=(6, 0))
+        for key in PROFILE_ORDER:
+            spec = PROFILES[key]
+            b = tk.Button(
+                p_row, text=f"{spec.emoji} {spec.name}",
+                command=lambda k=key: self._set_profile(k),
+                relief="flat", cursor="hand2", bd=0,
+                font=("Microsoft YaHei UI", 10), padx=12, pady=7,
+                bg=IDLE_BTN, fg=TEXT,
+                activebackground=IDLE_BTN_HOVER, activeforeground=TEXT)
+            p_row.add(b)
+            self._profile_btns[key] = b
+
+        self.profile_detail = tk.Label(
+            inner2, text="", bg=CARD, fg=MUTED,
+            font=("Microsoft YaHei UI", 9), anchor="w", justify="left")
+        self.profile_detail.pack(fill="x", pady=(8, 0))
+        wrap_to_parent(self.profile_detail, inner2)
+        self._set_profile(Profile.TURBO)
+
+        # ---- 卡片 3：游戏文件夹（手动兜底） ----
+        # 正常路径是第 1 页「🎮 游戏库」选游戏，这张卡是「自动扫描没找到 /
+        # 我想直接指一个目录」的兜底入口，所以排在档位后面。
         card = tk.Frame(col, bg=CARD, highlightbackground="#e5e7eb",
                         highlightthickness=1)
         card.pack(fill="x", pady=(0, 8))
@@ -632,69 +731,7 @@ class App:
         # 待导入的翻译包（用户在「导入翻译包」里选好，下一次开跑时消费掉）
         self._import_pkg = None
 
-        # ---- 卡片 2：性能档位 ----
-        card2 = tk.Frame(col, bg=CARD, highlightbackground="#e5e7eb",
-                         highlightthickness=1)
-        card2.pack(fill="x", pady=(0, 8))
-        inner2 = tk.Frame(card2, bg=CARD)
-        inner2.pack(fill="x", padx=16, pady=12)
-
-        tk.Label(inner2, text="性能档位", bg=CARD, fg=MUTED,
-                 font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
-
-        self.profile_var = tk.StringVar(value="turbo")
-        self._profile_btns: dict = {}
-        p_row = ButtonRow(inner2, bg=CARD)
-        p_row.pack(fill="x", pady=(6, 0))
-        for key in PROFILE_ORDER:
-            spec = PROFILES[key]
-            b = tk.Button(
-                p_row, text=f"{spec.emoji} {spec.name}",
-                command=lambda k=key: self._set_profile(k),
-                relief="flat", cursor="hand2", bd=0,
-                font=("Microsoft YaHei UI", 10), padx=12, pady=7,
-                bg=IDLE_BTN, fg=TEXT,
-                activebackground=IDLE_BTN_HOVER, activeforeground=TEXT)
-            p_row.add(b)
-            self._profile_btns[key] = b
-
-        self.profile_detail = tk.Label(
-            inner2, text="", bg=CARD, fg=MUTED,
-            font=("Microsoft YaHei UI", 9), anchor="w", justify="left")
-        self.profile_detail.pack(fill="x", pady=(8, 0))
-        wrap_to_parent(self.profile_detail, inner2)
-        self._set_profile(Profile.TURBO)
-
-        # ---- 卡片 3：翻译模型（与档位解耦，可单独选） ----
-        card3 = tk.Frame(col, bg=CARD, highlightbackground="#e5e7eb",
-                         highlightthickness=1)
-        card3.pack(fill="x", pady=(0, 8))
-        inner3 = tk.Frame(card3, bg=CARD)
-        inner3.pack(fill="x", padx=16, pady=12)
-
-        tk.Label(inner3, text="翻译模型", bg=CARD, fg=MUTED,
-                 font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
-
-        self._model_btns: dict = {}
-        self.model_row = ButtonRow(inner3, bg=CARD)
-        self.model_row.pack(fill="x", pady=(6, 0))
-
-        self.model_detail = tk.Label(
-            inner3, text="", bg=CARD, fg=MUTED,
-            font=("Microsoft YaHei UI", 9), anchor="w", justify="left")
-        self.model_detail.pack(fill="x", pady=(8, 0))
-        wrap_to_parent(self.model_detail, inner3)
-        self._build_model_buttons()
-
-        # 自定义模型：从任意位置选一个 .gguf 复制进 models\
-        self.pick_model_btn = tk.Button(
-            inner3, text="📂 选择模型文件…", command=self.pick_model_file,
-            bg="#f3f4f6", fg="#374151", activebackground="#e5e7eb",
-            relief="flat", cursor="hand2",
-            font=("Microsoft YaHei UI", 9), padx=12, pady=6)
-        self.pick_model_btn.pack(fill="x", pady=(8, 0))
-
-        # ---- 卡片 3.5：目标语言（多语言翻译） ----
+        # ---- 卡片 4：目标语言（多语言翻译） ----
         card35 = tk.Frame(col, bg=CARD, highlightbackground="#e5e7eb",
                           highlightthickness=1)
         card35.pack(fill="x", pady=(0, 8))
@@ -734,7 +771,7 @@ class App:
         wrap_to_parent(self.lang_hint, inner35)
         self._set_lang(self.target_lang)
 
-        # ---- 卡片 3.6：术语表（v2.6.2 起**全自动**，不再要用户点） ----
+        # ---- 卡片 5：术语表（v2.6.2 起**全自动**，不再要用户点） ----
         card36 = tk.Frame(col, bg=CARD, highlightbackground="#e5e7eb",
                           highlightthickness=1)
         card36.pack(fill="x", pady=(0, 8))
@@ -757,7 +794,7 @@ class App:
         self.gloss_hint.pack(fill="x", pady=(6, 0))
         wrap_to_parent(self.gloss_hint, inner36)
 
-        # ---- 卡片 4：校对与交付 ----
+        # ---- 卡片 6：校对与交付 ----
         card4 = tk.Frame(col, bg=CARD, highlightbackground="#e5e7eb",
                          highlightthickness=1)
         card4.pack(fill="x", pady=(0, 8))
@@ -818,7 +855,7 @@ class App:
         self.pkg_hint.pack(fill="x", pady=(6, 0))
         wrap_to_parent(self.pkg_hint, inner4)
 
-        # ---- 卡片 4.5：一键汉化（用现成翻译包，免模型） ----
+        # ---- 卡片 7：一键汉化（用现成翻译包，免模型） ----
         # 跟上面的「开始汉化」是**并列的两条路**：
         #   开始汉化 = 用自己的模型把游戏翻出来（要模型、要等）
         #   一键汉化 = 拿现成的 .gtpkg 直接写进游戏（零模型、几秒）
@@ -896,7 +933,7 @@ class App:
         self.repo_tip.pack(fill="x", pady=(6, 0))
         wrap_to_parent(self.repo_tip, inner45)
 
-        # ---- 卡片 5：运行时翻译（整合 LunaTranslator） ----
+        # ---- 卡片 8：运行时翻译（整合 LunaTranslator） ----
         card5 = tk.Frame(col, bg=CARD, highlightbackground="#e5e7eb",
                          highlightthickness=1)
         card5.pack(fill="x", pady=(0, 8))
@@ -1090,8 +1127,9 @@ class App:
         wrap_to_parent(self.lib_detail, mid)
 
         # ---- ③ 底部：任务进度（醒目）+ 操作 ----
-        # 用户是在这一页点的「汉化这个游戏」，进度就必须在这一页看得见 ——
-        # 而不是要切到「高级设置」才知道软件在动。
+        # 这一页也摆一份进度 —— 一来扫描/装包时任务就在这一页开跑，
+        # 二来用户从第 2 页切回来时还能看见刚才跑到哪了。
+        # （真正的主进度在「📊 进度与设置」：点汉化会自动切过去看那一页）
         self.lib_stage = tk.Label(
             mid, text="", bg=CARD, fg=ACCENT_DARK,
             font=("Microsoft YaHei UI", 11, "bold"), anchor="w",
@@ -1406,9 +1444,12 @@ class App:
                   kind: str = "info") -> None:
         """游戏库页那行「正在干什么」+ 进度条。
 
-        用户是在这一页点的一键汉化，进度就必须在这一页看得见 —— 界面上
+        用户是在这一页点的按钮，进度就必须在这一页也看得见 —— 界面上
         没有动静，用户会以为按钮没生效（实测踩过：装包其实在跑，但反馈
-        只在「高级设置」页，用户以为"点了没效果"）。
+        只在第 2 页，用户以为"点了没效果"）。
+
+        顺带：点汉化会**自动切到第 2 页**（`_goto_progress`），那里的进度条
+        和运行日志才是主视角；这里这份是用户切回来时的"刚才跑到哪了"。
         """
         colors = {"info": ACCENT_DARK, "ok": OK_GREEN,
                   "err": ERR_RED, "warn": WARN_AMBER}
@@ -1486,9 +1527,12 @@ class App:
             except tk.TclError:
                 pass
         if busy:
-            # 忙的时候按钮本身也要说话 —— 不然用户会以为点了没反应
+            # 忙的时候按钮本身也要说话 —— 不然用户会以为点了没反应。
+            # 注意别写「进度见下方」：点了汉化会被自动切到第 2 页，
+            # 这一页就在下面看不见了（曾这么写过，用户被指错地方）。
             try:
-                self.lib_apply_btn.configure(text="⏳ 正在处理，进度见下方…")
+                self.lib_apply_btn.configure(
+                    text=f"⏳ 正在处理…（进度在「{ADV_TAB_NAME}」）")
             except tk.TclError:
                 pass
             return
@@ -1511,6 +1555,22 @@ class App:
             pass
 
     # ---- 一键处理（智能路由） ----
+
+    def _goto_progress(self) -> None:
+        """把界面切到「📊 进度与设置」页。
+
+        **为什么必须切**：进度条和运行日志都长在第 2 页。用户是在第 1 页
+        （游戏库）点的「汉化这个游戏」，如果不切过去，那一页除了按钮文案
+        变一下之外毫无动静 —— 用户会以为按钮没生效。实测就是这么反馈的：
+        「点了翻译没反应，其实在跑」。
+
+        只在**真正要开跑**的时候调（不是一点按钮就切，用户还能取消）。
+        界面没构造完 / 已销毁时静默跳过，绝不能因为切页失败把任务搞崩。
+        """
+        try:
+            self.nb.select(self._adv_page)
+        except (tk.TclError, AttributeError):
+            pass
 
     def lib_apply(self):
         """「汉化这个游戏」—— 用户不用管底下是装包还是跑模型。
@@ -1541,7 +1601,7 @@ class App:
                 APP_NAME,
                 f"《{ent.name}》这层目录认不出游戏引擎 —— "
                 "它可能不是游戏根目录，或者这款游戏暂不支持。\n\n"
-                "如果确定是游戏，可以在「高级设置」里手动选它试试。")
+                f"如果确定是游戏，可以在「{ADV_TAB_NAME}」里手动选它试试。")
             return
 
         if ent.pkg_path and ent.pkg_verdict in ("match", "partial"):
@@ -1552,10 +1612,12 @@ class App:
                     rec = r
                     break
             if rec is not None:
+                self._goto_progress()          # 切到有进度条和日志的那一页
                 self._start_apply_package(Path(ent.path), rec)
                 return
             self._log(f"软件里记的那个翻译包找不到了（{ent.pkg_path}）——"
                       "这次改用模型翻译。", "warn")
+        self._goto_progress()                  # 同上：切过去才能看见进度
         self.start()
 
     def lib_enter_game(self, ent: GameEntry) -> None:
@@ -1587,6 +1649,7 @@ class App:
             messagebox.showinfo(APP_NAME, "先在表格里选一个游戏。")
             return
         self.lib_enter_game(ent)
+        self._goto_progress()                  # 还原也要跑一会儿，进度在那一页
         self.revert_game()
 
     def lib_open_dir(self):
@@ -1722,6 +1785,9 @@ class App:
                 activebackground=ACCENT_DARK if sel else IDLE_BTN_HOVER,
                 activeforeground="white" if sel else TEXT)
         self._render_profile_detail(key.value)
+        # 「自动」选模型是按档位挑大小的，档位一变，模型说明就得跟着重画 ——
+        # 否则用户切了档位，那行「当前使用：…」还停在旧档位的结论上。
+        self._render_model_detail()
 
     def _render_profile_detail(self, key_str: str):
         try:
@@ -1809,11 +1875,15 @@ class App:
                      "重启软件即可（可放多个，这里会都列出来）。")
             return
 
+        # 档位变量可能还没建 —— 卡片顺序是「翻译模型」在前、「性能档位」在后，
+        # 所以第一次渲染模型说明时 profile_var 还不存在。用 getattr 兜底取
+        # 默认档位（turbo），否则这里会静默走进 except，显示一个选错的模型名。
+        _pv = getattr(self, "profile_var", None)
         try:
+            _prof = (_pv.get() if _pv is not None else "") or "turbo"
             picked = pick_model(
                 ggufs, mode=self.model_pref,
-                prefer_small=PROFILES[Profile(self.profile_var.get() or "turbo")]
-                .prefer_small_model)
+                prefer_small=PROFILES[Profile(_prof)].prefer_small_model)
         except Exception:  # noqa: BLE001
             picked = ggufs[0]
 
@@ -2504,8 +2574,8 @@ class App:
         else:
             self.speed_var.set("")
             self.stage_var.set(f"{stage}：{desc}" if desc else stage)
-        # 游戏库页顶部也摆一份同样的进度 —— 用户在那边点的按钮，
-        # 不该切到「高级设置」才看得见它在干什么。
+        # 游戏库页顶部也摆一份同样的进度 —— 用户从第 2 页切回来时，
+        # 那行字还在，一眼就知道刚才跑到哪了。
         self._lib_task(self.stage_var.get(), pct=overall)
         try:
             self.lib_status.configure(text=self.stage_var.get(), fg=MUTED)
@@ -3637,6 +3707,21 @@ def _boot_test() -> int:
             f"游戏表：{n_rows} 行 / 数据 {len(app._lib_entries)} 条")
         rec(bool(app.nb.tabs()), f"页签：{[app.nb.tab(t, 'text').strip() for t in app.nb.tabs()]}")
 
+        # v2.6.5：页签名 + 「点了汉化必须切到进度页」这条行为。
+        # 事故背景：用户在游戏库点「汉化这个游戏」，翻译确实在跑，但进度和
+        # 日志都长在第 2 页 —— 那一页什么动静都没有，用户以为按钮是坏的。
+        _tabs = [app.nb.tab(t, "text").strip() for t in app.nb.tabs()]
+        rec(len(_tabs) >= 2 and "游戏库" in _tabs[0],
+            f"页签 1 = 游戏库（默认页）：{_tabs}")
+        rec(len(_tabs) >= 2 and _tabs[1] == ADV_TAB_NAME,
+            f"页签 2 = {ADV_TAB_NAME}：{_tabs}")
+        app.nb.select(0)
+        app._goto_progress()
+        rec(app.nb.index("current") == 1,
+            f"_goto_progress 把界面切到第 2 页（当前第 "
+            f"{int(app.nb.index('current')) + 1} 页）")
+        app.nb.select(0)
+
         try:
             app.on_close()
             rec(True, "关窗收尾正常")
@@ -3716,7 +3801,7 @@ def _selfcheck():
     for _m in ("_lib_bootstrap", "_lib_boot_next", "_lib_fill_quick",
                "_lib_scan_worker", "_lib_scan_done", "_lib_insert",
                "_lib_refresh_buttons", "_lib_sync_after_change",
-               "_lib_task", "_lib_progress_reset"):
+               "_lib_task", "_lib_progress_reset", "_goto_progress"):
         rec(hasattr(App, _m), f"游戏库：界面方法 {_m} 存在")
     try:
         import tempfile as _tf

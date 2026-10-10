@@ -158,18 +158,47 @@ def main() -> int:
                       "from gametl.core.library import"):
             check(token in gui_src, f"gui.py 缺少 {token}")
         check("nb.add(lib_page" in gui_src and "nb.add(adv_page" in gui_src,
-              "gui.py 没有把游戏库 / 高级设置做成两个页签")
+              "gui.py 没有把游戏库 / 进度与设置做成两个页签")
         check(gui_src.index("nb.add(lib_page") < gui_src.index("nb.add(adv_page"),
-              "游戏库页签必须排在高级设置之前（默认页）")
+              "游戏库页签必须排在第 2 页之前（默认页）")
         # 傻瓜式：主界面不该再把「术语表」当卡片标题摆出来
         check("术语表（让专有名词全篇译法统一）" not in gui_src
               or gui_src.index("术语表（让专有名词全篇译法统一）")
               > gui_src.index("nb.add(adv_page"),
-              "专业概念（术语表）必须待在「高级设置」页里")
+              "专业概念（术语表）必须待在第 2 页（📊 进度与设置）里")
         # 两个入口共用一条安装通道
         check("def _start_apply_package" in gui_src
               and gui_src.count("_start_apply_package") >= 3,
               "两个入口应共用 _start_apply_package")
+
+        # ---- 9b) v2.6.5：页签名不能退回「高级设置」+ 点汉化必须切页 ----
+        # 事故：用户在游戏库点「汉化这个游戏」，翻译确实在跑，可进度条和
+        # 运行日志都在第 2 页 —— 那一页毫无动静，用户以为按钮是坏的。
+        check("⚙ 高级设置" not in gui_src,
+              "页签标题不该再叫「高级设置」（用户点完汉化会被自动送进去，"
+              "名字得像「进度」而不是「高级」）")
+        check("ADV_TAB_TEXT" in gui_src
+              and "nb.add(adv_page, text=ADV_TAB_TEXT" in gui_src,
+              "第 2 页标题应走 ADV_TAB_TEXT 常量（改名时不会漏掉提示文案）")
+        check("def _goto_progress" in gui_src,
+              "gui.py 缺少 _goto_progress（点汉化切到进度页）")
+        # 两个「从游戏库发起」的入口都必须切页：汉化、还原
+        for fn in ("def lib_apply", "def lib_revert"):
+            seg = gui_src[gui_src.index(fn):]
+            nxt = seg.find("\n    def ", 1)
+            body = seg if nxt < 0 else seg[:nxt]
+            check("_goto_progress()" in body,
+                  f"{fn.split()[-1]} 里没调 _goto_progress()，"
+                  "用户在游戏库点完看不到进度")
+        # 「进度见下方」是错文案：切页之后那一页就不在下方了。
+        # 用完整旧字面量匹配（注释里也会引用这半句话做说明，别误伤）。
+        check("⏳ 正在处理，进度见下方" not in gui_src,
+              "按钮文案不能写「进度见下方」—— 点完会切到第 2 页，不在下方")
+        # 正向：忙的时候按钮必须把用户指到第 2 页去
+        _rb = gui_src[gui_src.index("def _lib_refresh_buttons"):]
+        _rb = _rb[:_rb.find("\n    def ", 1)]
+        check("ADV_TAB_NAME" in _rb,
+              "忙的时候按钮文案没指向第 2 页（应该拼 ADV_TAB_NAME）")
 
         # ---- 10) library 不许反向依赖 gui（会成环） ----
         lib_src = (ROOT / "gametl" / "core" / "library.py").read_text(

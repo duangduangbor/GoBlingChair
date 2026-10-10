@@ -118,8 +118,8 @@ def main() -> int:
         FAILED.append("缺少 build_glossary_clicked 方法（留作内部能力）")
     print("[OK] 术语表已改为全自动（无手工按钮）")
 
-    # ---- 游戏库页的进度反馈（v2.6.2）：用户在这一页点按钮，
-    #      就必须在这一页看到进度，不能只在「高级设置」里跑 ----
+    # ---- 游戏库页的进度反馈（v2.6.2）：这一页也摆一份进度，
+    #      v2.6.5 起点汉化还会自动切到「📊 进度与设置」看主进度 ----
     for attr in ("lib_stage", "lib_progress", "lib_status"):
         if not hasattr(app, attr):
             FAILED.append(f"缺少游戏库进度控件 {attr}")
@@ -176,10 +176,34 @@ def main() -> int:
         if "游戏库" not in str(app.nb.tab(0, "text")):
             FAILED.append("第 1 页标题不是「游戏库」")
         if len(app.nb.tabs()) < 2:
-            FAILED.append("应该有两个页签（游戏库 / 高级设置）")
+            FAILED.append("应该有两个页签（游戏库 / 进度与设置）")
+        # v2.6.5：第 2 页不叫「高级设置」—— 用户点完汉化会被自动送进去看进度，
+        # 一个叫「高级设置」的页签会让他以为自己点错了地方
+        tabs = [str(app.nb.tab(t, "text")).strip() for t in app.nb.tabs()]
+        if len(tabs) >= 2 and tabs[1] != "📊 进度与设置":
+            FAILED.append(f"第 2 页标题应为「📊 进度与设置」，实际是「{tabs[1]}」")
     except Exception:
         traceback.print_exc()
         FAILED.append("读 Notebook 页失败")
+
+    # ---- v2.6.5：点了汉化要把界面切到进度页 ----
+    #      事故：翻译确实在跑，但进度条和日志都在第 2 页，第 1 页毫无动静，
+    #      用户以为按钮坏了。
+    if not hasattr(app, "_goto_progress"):
+        FAILED.append("缺少 _goto_progress 方法")
+    else:
+        try:
+            app.nb.select(0)
+            app._goto_progress()
+            if int(app.nb.index("current")) != 1:
+                FAILED.append(
+                    f"_goto_progress 没把界面切到第 2 页（当前第 "
+                    f"{int(app.nb.index('current')) + 1} 页）")
+            app.nb.select(0)
+        except Exception:
+            traceback.print_exc()
+            FAILED.append("_goto_progress 抛异常")
+    print("[OK] 点汉化会自动切到「进度与设置」页")
     # 一个游戏都没选 → 三个操作按钮都该是禁用
     for attr in ("lib_apply_btn", "lib_revert_btn", "lib_open_btn"):
         if str(getattr(app, attr).cget("state")) != "disabled":

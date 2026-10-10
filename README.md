@@ -25,6 +25,25 @@
 
 ## 更新日志
 
+### v2.6.5
+
+- **点「汉化这个游戏」会自动跳到「📊 进度与设置」页**。以前进度条和运行日志都长在第 2 页，
+  而用户在游戏库点完汉化之后界面毫无动静（只在按钮文案上变一下），**很多人以为按钮没生效，
+  其实翻译正在跑**。现在软件在**真正开跑**的那一刻切过去，进度一目了然；还原原版同理。
+- **第 2 页改名：「⚙ 高级设置」→「📊 进度与设置」**。一个叫「高级设置」的页签会让人
+  以为自己点错了地方；改名之后它同时也承担「翻译进度在这里」的指路作用。
+  页签名抽成了**单一来源常量**，界面上所有「去那一页看看」的提示文案都引用它，
+  以后再改名不会再漏掉某处把用户指错方向。
+- **同页重排卡片，让「选模型」不用找**：左栏卡片按「用户多久改一次」重排，
+  **「翻译模型」提到第一张**（进去就是它，不用滚动），「游戏文件夹」降级为
+  「自动扫描没找到 / 我想直接指一个目录」的兜底入口。
+- 修掉三个顺带查出来的真问题：忙时按钮文案写着「进度见下方」（切页之后那一页就不在下方了，
+  等于把用户指错地方）；模型卡片前置后一处读取了尚未创建的变量，会**静默显示一个选错的模型名**；
+  切性能档位时模型说明不刷新。
+- 回归新增页签/切页断言；`test_v17_layout_gui` 修掉一个**陈旧前提**（分栏从 v2.6.0 起搬进
+  第 2 页，而该页默认未选中——未映射控件的宽度恒为 1，导致这个测试一直在量空气），
+  并把它和 `test_v17_installer_gui` 一起收进批量回归（现在共 27 个用例）。
+
 ### v2.6.4
 
 - **预算不足时不再「整张表放弃」**：dfpf 封包资源的解压后字节数有硬上限（超了游戏启动
@@ -52,7 +71,8 @@
 ### v2.6.0 – v2.6.2
 
 - **v2.6.0 / v2.6.1 傻瓜式「游戏库」**：打开就是一张扫好的游戏表，选中 → 点一下即可。
-  术语表 / 模型 / 性能档位等专业概念收进「⚙ 高级设置」页（功能一个没删，默认看不见）。
+  术语表 / 模型 / 性能档位等专业概念收进第 2 个页签（功能一个没删，默认看不见）。
+  （该页签 v2.6.0 起叫「⚙ 高级设置」，**v2.6.5 起改名「📊 进度与设置」**。）
 - **v2.6.2 术语表全自动 + 进度搬到游戏库页**：不再需要手动点「生成术语表」，
   进度直接显示在游戏库页的状态行与进度条上。
 
@@ -61,7 +81,7 @@
 ### 方式一：下载便携版（推荐普通用户）
 
 1. 到 [Releases](../../releases) 下载最新的 exe（单文件，约 16.7 MB，免安装）
-   > Release 上的资产名形如 `GoBlingChair-v2.6.4.exe`（GitHub 不接受中文资产名），
+   > Release 上的资产名形如 `GoBlingChair-vX.Y.Z.exe`（GitHub 不接受中文资产名），
    > 下载后可以随意改名，叫 `滚刀哥布林汉化椅.exe` 也行 —— 程序本身不依赖文件名。
 2. 把它放进一个文件夹，双击运行
 
@@ -129,6 +149,71 @@ gametl/                  ← 主源码包
 gametl/README.md         ← 开发者技术文档（二十九章实战经验，强烈推荐）
 build_exe.spec           ← PyInstaller 打包配置
 ```
+
+---
+
+## English
+
+**GoBlingChair** is a **fully offline game-translation tool for Windows** that turns a game folder
+into a playable Simplified-Chinese version using a **local LLM** — no network, no uploads, no API
+keys, no cost.
+
+Pick a game folder → click translate → get a translated build. The tool detects the engine, unpacks
+the archives, extracts the text, translates it with an Ollama model running on your own PC, writes
+the result back, and repacks — end to end.
+
+### Features
+
+- 🔌 **100% offline and private** — translation runs on a local GGUF model through a bundled
+  portable Ollama runtime. Nothing ever leaves your machine.
+- 🧩 **Six engines** (table below), from `.xp3` / `.rpa` archives to binary Unity `.assets`.
+- ⏸️ **Resumable** — results are checkpointed as they go, so you can stop and continue later.
+- 📖 **Glossary support** — force your own wording for character names and proper nouns so they stay
+  consistent across the whole game.
+- 🧪 **Three-layer QA** — instant validation → rule-based proofreading → model spot-checks.
+- ↩️ **Reversible install** — the originals are backed up before patching; one click restores them.
+- 📦 **Shareable translation packs** — ship a finished translation as one file; the recipient
+  installs it **without needing a model**.
+- 🎮 **Runtime translation** — launches [LunaTranslator](https://github.com/HIllya51/LunaTranslator)
+  (downloaded separately) pointed at the local model, for games you can't patch.
+
+### Supported engines
+
+| Engine | Support | Notes |
+|---|---|---|
+| RPG Maker MV / MZ | ✅ Full | Plain-text JSON read/write, including plugin JS UI strings |
+| KiriKiri | ✅ Full | `.xp3` unpack / write-back / repack (works alongside GARbro); handles UTF-16 and font issues |
+| Ren'Py | ✅ Full | `.rpa` unpack, `.rpy` read/write |
+| Unity | ✅ Full | TextAssets inside `*_Data/*.assets` (Yarn Spinner dialogue, CSV text tables), written back into the binary |
+| Double Fine (Buddha / Moai) | ✅ Full | `.~h` / `.~p` packs (Costume Quest 1·2, Stacking, Headlander…); in-place replacement preferred, no external tools needed |
+| Generic plain text | ✅ Fallback | Unpacked games: `.txt` / `.csv` / `.json` / `.xml` / `.srt` / `.ass` / `.po`, UTF-8 only |
+
+### Quick start
+
+1. Download the latest exe from [Releases](../../releases) — a single file, ~16.7 MB, no installer.
+2. Drop it into a folder and run it. First use also needs an Ollama runtime (`runtime\`) and a
+   `.gguf` model in `models\` — put any Ollama-compatible model there and the app picks it up.
+3. Open the app, pick your game from the scanned library, click translate, and watch the progress.
+
+Or from source (Python 3.8+ with tkinter):
+
+```bash
+python -m gametl doctor            # environment check
+python -m gametl.gui               # launch the GUI
+python -m gametl detect  "GAME_DIR"
+python -m gametl extract "GAME_DIR" -o project.json
+python -m gametl translate project.json --model qwen2.5:7b-instruct
+python -m gametl writeback project.json -o out/
+```
+
+### Notes
+
+- The UI is Chinese-only — the tool is built for translating **into** Chinese.
+- Recommended models: a general **Qwen2.5-7B-Instruct** (~Q4_K_M, better quality, ≥6 GB VRAM) or a
+  translation-tuned **Hunyuan-MT-1.8B** (faster, ≥2 GB VRAM). The app detects your VRAM and
+  recommends a tuning profile automatically.
+- This tool is intended for translating **games you legally own**, for personal study and research.
+  Do not use it to distribute pirated software or to circumvent copy protection.
 
 ## 合规声明
 
