@@ -235,6 +235,61 @@ def test_real_window() -> None:
     app2.on_close()
 
 
+def test_library_fits_small_window() -> None:
+    section("[5] 游戏库页：小窗口下按钮不能被挤没")
+
+    # 事故（用户 2026-10-10 截图，窗口 1080×756）：游戏库页表格下面那排
+    # 「▶ 汉化这个游戏 / ↩ 还原原版 / 📂 打开文件夹」**一个像素都没画出来**
+    # —— mapped=0、h=1。用户根本点不到，只能去点底部那条「▶ 开始汉化」，
+    # 而那条又没接跳页，于是反馈「点汉化不能跳转到能看到进度的页面」。
+    #
+    # 根因不是"没写按钮"，是 pack 的分配顺序：mid 卡片里按**从上往下**摆，
+    # 容器不够高时 pack 把**最后 pack 的那个**挤成 0 高。实测需要 591px
+    # 只拿到 302px，连默认的 1180×840 也一样（426 < 591），所以用户从装机
+    # 第一天起就没见过这颗按钮。
+    #
+    # 修法：底部那几块改 side="bottom" 从下往上 pack，表格（expand=True）让位。
+    # 这条断言就是钉住修法的 —— 只要有人再把 pack 顺序改回从上往下，它立刻红。
+    try:
+        import tkinter as tk
+    except ImportError:
+        rec(False, "当前 Python 没有 tkinter，跳过真窗口检查")
+        return
+
+    install_thread_hook()
+    import gametl.gui as G
+
+    root = tk.Tk()
+    app = G.App(root)
+
+    def pump(seconds: float) -> None:
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            root.update()
+            time.sleep(0.02)
+
+    pump(1.2)
+    root.geometry("1080x756")                # 用户截图那个尺寸
+    pump(1.2)
+
+    rec(app.nb.index("current") == 0, "默认停在「游戏库」页（不切页才量得准）")
+    for label, w in (("汉化这个游戏", app.lib_apply_btn),
+                     ("还原原版", app.lib_revert_btn),
+                     ("打开文件夹", app.lib_open_btn)):
+        rec(w.winfo_ismapped() and w.winfo_height() > 10,
+            f"1080×756 下「{label}」按钮画得出来"
+            f"（mapped={int(w.winfo_ismapped())} h={w.winfo_height()}）")
+    rec(app.lib_progress.winfo_ismapped() and app.lib_progress.winfo_height() > 4,
+        f"1080×756 下游戏库的进度条也可见（h={app.lib_progress.winfo_height()}）")
+    rec(app.lib_stage.winfo_ismapped(),
+        "1080×756 下「正在干什么」那行大字可见（不然切回来什么都不知道）")
+    rec(app.lib_tree.winfo_height() > 40,
+        f"表格仍然给得出高度（h={app.lib_tree.winfo_height()}）——"
+        "被挤的应该是它，不是按钮")
+
+    app.on_close()
+
+
 # ---------------------------------------------------------------- main
 def main() -> int:
     try:
@@ -242,6 +297,7 @@ def main() -> int:
         test_button_cols()
         test_prefs()
         test_real_window()
+        test_library_fits_small_window()
     finally:
         import shutil
         shutil.rmtree(TMP, ignore_errors=True)

@@ -25,10 +25,16 @@
     │  │ │ CQ2    │ 已汉化 │ Unity  │ D:\\...         │    │
     │  │ │ 星露谷 │ 可一键 │ RPG MV │ D:\\...         │    │
     │  │ └────────┴────────┴────────┴────────────────┘    │
-    │  │ [▶ 汉化这个游戏] [↩ 还原] [📂 打开] [🔄 重扫]     │
     │  │ 扫到 12 个游戏 · 3 个可一键汉化 · 2 个已汉化      │
+    │  │ 正在翻译… 1234/13435  ████████░░░░░░░░░░░░░░      │
+    │  │ [▶ 汉化这个游戏] [↩ 还原] [📂 打开] [🔄 重扫]     │
     │  └──────────────────────────────────────────────────┘
     └────────────────────────────────────────────────────┘
+
+⚠️ 卡片下半部（进度 / 状态 / 按钮那一排）是**从下往上 pack 的**，不是从上往下 ——
+   窗口一矮，pack 会从最后 pack 的那个开始把控件挤成 0 高。实测 1080×756 时
+   「▶ 汉化这个游戏」整排 h=1 / mapped=0（屏幕上一个像素都没有），用户根本点不到，
+   只能去点底部那条「▶ 开始汉化」。所以底排必须先把高度占住，让表格去挤。
 
 第二页（左设置 / 右进度+日志，中间分隔条可拖）::
 
@@ -1054,15 +1060,11 @@ class App:
             font=("Microsoft YaHei UI", 10, "bold"), padx=16, pady=6)
         self.lib_scan_btn.pack(side="left", padx=(8, 0))
 
-        # 常见位置一键填（用户连路径都不用找）
-        self.lib_quick_row = ButtonRow(top_in, bg=CARD)
-        self.lib_quick_row.pack(fill="x", pady=(8, 0))
-
-        self.lib_hint = tk.Label(
-            top_in, text="", bg=CARD, fg=MUTED,
-            font=("Microsoft YaHei UI", 8), anchor="w", justify="left")
-        self.lib_hint.pack(fill="x", pady=(6, 0))
-        wrap_to_parent(self.lib_hint, top_in)
+        # 这里曾经摆过一排「📁 D:\SteamLibrary\steamapps\common」快捷按钮
+        # （开机探测到的常见位置），下面还有一行「上面这几个是自动找到的…」。
+        # 已按用户要求整排撤掉：真正让用户一眼看到游戏的是下面那张表，那排按钮
+        # 只是把同一件事再说一遍。探测本身留着（`_lib_fill_quick`），开机仍然
+        # 自动扫一遍 —— 打开就该有表，而不是一个空框。
 
         # ---- ② 游戏表 ----
         mid = tk.Frame(page, bg=CARD, highlightbackground="#e5e7eb",
@@ -1093,12 +1095,14 @@ class App:
         style.map("Lib.Treeview", background=[("selected", "#dbeafe")],
                   foreground=[("selected", "#1e40af")])
 
+        # 表格的 pack 挪到最后（见下面「从下往上 pack」那段注释）。
+        # height=8 而不是 12：窗口一矮，表格先让步，把高度让给进度和按钮
+        # —— 表里少看见两行无所谓，按钮不见了用户就没法干活了。
         tree_wrap = tk.Frame(mid, bg=CARD)
-        tree_wrap.pack(fill="both", expand=True, padx=16, pady=(8, 0))
         cols = ("game", "status", "type", "path")
         self.lib_tree = ttk.Treeview(
             tree_wrap, columns=cols, show="headings", selectmode="browse",
-            style="Lib.Treeview", height=12)
+            style="Lib.Treeview", height=8)
         for cid, text, width, stretch in (
                 ("game", "游戏", 260, False),
                 ("status", "状态", 130, False),
@@ -1120,38 +1124,23 @@ class App:
                            lambda e: self._lib_on_select())
         self.lib_tree.bind("<Double-1>", lambda e: self.lib_apply())
 
-        self.lib_detail = tk.Label(
-            mid, text="", bg=CARD, fg=MUTED,
-            font=("Microsoft YaHei UI", 9), anchor="w", justify="left")
-        self.lib_detail.pack(fill="x", padx=16, pady=(6, 0))
-        wrap_to_parent(self.lib_detail, mid)
-
         # ---- ③ 底部：任务进度（醒目）+ 操作 ----
         # 这一页也摆一份进度 —— 一来扫描/装包时任务就在这一页开跑，
         # 二来用户从第 2 页切回来时还能看见刚才跑到哪了。
         # （真正的主进度在「📊 进度与设置」：点汉化会自动切过去看那一页）
-        self.lib_stage = tk.Label(
-            mid, text="", bg=CARD, fg=ACCENT_DARK,
-            font=("Microsoft YaHei UI", 11, "bold"), anchor="w",
-            justify="left")
-        self.lib_stage.pack(fill="x", padx=16, pady=(10, 0))
-        wrap_to_parent(self.lib_stage, mid)
-
-        style.configure("Lib.Horizontal.TProgressbar", thickness=12,
-                        background=ACCENT)
-
-        self.lib_progress = ttk.Progressbar(
-            mid, style="Lib.Horizontal.TProgressbar", maximum=100, value=0)
-        self.lib_progress.pack(fill="x", padx=16, pady=(6, 0))
-
-        self.lib_status = tk.Label(
-            mid, text="", bg=CARD, fg=MUTED,
-            font=("Microsoft YaHei UI", 9), anchor="w", justify="left")
-        self.lib_status.pack(fill="x", padx=16, pady=(6, 0))
-        wrap_to_parent(self.lib_status, mid)
-
+        #
+        # ★★ 这几块**按从下往上的顺序 pack，而且要 `side="bottom"`**。
+        #    pack 是按调用顺序分配空间的：容器不够高时，**最后 pack 的那个
+        #    先被挤成 0 高**。原来这里是从上往下 pack，于是窗口 1080×756（用户
+        #    截图就是这个尺寸）时 `mid` 需要 591px 只拿到 302px，
+        #    「▶ 汉化这个游戏 / ↩ 还原原版 / 📂 打开文件夹」整排 h=1、mapped=0
+        #    ——**屏幕上一个像素都没有**，用户根本点不到，只能去点底部那条
+        #    「▶ 开始汉化」。实测连默认的 1180×840 也一样（mid 426 < 591）。
+        #    改成 side="bottom" 之后这几块先把自己的高度占住，剩下的才给表格，
+        #    表格是 `expand=True` 的，本来就该由它来吸收挤压。
+        #    顺序（先 pack 的在最下）：act → status → progress → stage → detail → 表格。
         act = tk.Frame(mid, bg=CARD)
-        act.pack(fill="x", padx=16, pady=(10, 12))
+        act.pack(side="bottom", fill="x", padx=16, pady=(10, 12))
         self.lib_apply_btn = tk.Button(
             act, text="▶  汉化这个游戏", command=self.lib_apply,
             bg=OK_GREEN, fg="white", activebackground="#128a3e",
@@ -1173,6 +1162,39 @@ class App:
             font=("Microsoft YaHei UI", 10), padx=14, pady=9,
             state="disabled")
         self.lib_open_btn.pack(side="left", padx=(8, 0))
+
+        # 往上一层：状态 / 进度条 / 大字阶段（同样是 side="bottom"，先 pack 的在下面）
+        self.lib_status = tk.Label(
+            mid, text="", bg=CARD, fg=MUTED,
+            font=("Microsoft YaHei UI", 9), anchor="w", justify="left")
+        self.lib_status.pack(side="bottom", fill="x", padx=16, pady=(6, 0))
+        wrap_to_parent(self.lib_status, mid)
+
+        # 进度条先建出来占位 —— 不跑任务时它是空的一条，看得见"这里会有进度"
+        style.configure("Lib.Horizontal.TProgressbar", thickness=12,
+                        background=ACCENT)
+        self.lib_progress = ttk.Progressbar(
+            mid, style="Lib.Horizontal.TProgressbar", maximum=100, value=0)
+        self.lib_progress.pack(side="bottom", fill="x", padx=16, pady=(6, 0))
+
+        self.lib_stage = tk.Label(
+            mid, text="", bg=CARD, fg=ACCENT_DARK,
+            font=("Microsoft YaHei UI", 11, "bold"), anchor="w",
+            justify="left")
+        self.lib_stage.pack(side="bottom", fill="x", padx=16, pady=(10, 0))
+        wrap_to_parent(self.lib_stage, mid)
+
+        # 选中行下面那行小字（游戏名 —— 状态 · 备注 · 类型 · 包匹配提醒）
+        self.lib_detail = tk.Label(
+            mid, text="", bg=CARD, fg=MUTED,
+            font=("Microsoft YaHei UI", 9), anchor="w", justify="left")
+        self.lib_detail.pack(side="bottom", fill="x", padx=16, pady=(6, 0))
+        wrap_to_parent(self.lib_detail, mid)
+
+        # ★ 最后才 pack 表格：它是 expand=True 的那一个，剩下的高度全归它，
+        #   窗口不够高时也由它先让步（绝不会再出现"按钮被挤没"）。
+        tree_wrap.pack(side="top", fill="both", expand=True,
+                       padx=16, pady=(8, 0))
 
         # 游戏库自己的状态
         self._lib_entries: list[GameEntry] = []
@@ -1228,35 +1250,25 @@ class App:
         return False
 
     def _lib_fill_quick(self) -> None:
-        """把探测到的常见游戏位置做成一排快捷按钮。"""
+        """开机探测常见游戏位置 —— **只探测，不再往界面上摆快捷按钮**。
+
+        以前这里会把探测到的位置做成一排「📁 D:\\SteamLibrary\\steamapps…」
+        按钮。用户反馈那一排可以不要了，理由也站得住：真正让用户一眼看到游戏的是
+        下面那张表，那排按钮只是把同一件事再说一遍，还把「选位置」这块挤得很乱
+        （这一页本来就矮，见 `_build_library_page` 里那段「从下往上 pack」）。
+
+        探测结果本身仍然要留着 —— `_lib_bootstrap` 靠它开机自动扫一遍，
+        用户打开软件就该看见一张表，而不是一个空框。
+        """
         try:
             roots = common_roots()
         except Exception:                      # noqa: BLE001
             roots = []
         self._lib_quick_roots = roots[:4]
-        self.lib_quick_row.clear()
-        for p in self._lib_quick_roots:
-            short = str(p)
-            if len(short) > 34:
-                short = "…" + short[-33:]
-            b = tk.Button(
-                self.lib_quick_row, text=f"📁 {short}",
-                command=lambda q=str(p): self._lib_use_root(q),
-                relief="flat", cursor="hand2", bd=0,
-                font=("Microsoft YaHei UI", 9), padx=10, pady=5,
-                bg="#eef6ff", fg="#1e40af",
-                activebackground="#dbeafe", activeforeground="#1e40af")
-            self.lib_quick_row.add(b)
-        if self._lib_quick_roots:
-            self.lib_hint.configure(
-                text=f"上面这几个是自动找到的游戏位置，点一下就能扫。"
-                     f"（共 {len(roots)} 处）")
-        else:
-            self.lib_hint.configure(
-                text="没自动找到常见游戏位置 —— 点「选择文件夹」指一下"
-                     "游戏装在哪个盘就行。")
 
     def _lib_use_root(self, path: str) -> None:
+        # 以前那排快捷按钮的回调。按钮已撤，保留这个入口是因为自检与回归都
+        # 在按名字检查它（见 --selfcheck 的 hasattr 清单 / test_v260_library）。
         self.lib_root_var.set(path)
         self.lib_scan()
 
@@ -2132,6 +2144,13 @@ class App:
         if self._pkg_busy():
             messagebox.showinfo(APP_NAME, "翻译包任务还在跑，请等它结束。")
             return
+
+        # ★ 切到「📊 进度与设置」—— 主进度条和运行日志都长在那一页。
+        #   底部这条「▶ 开始汉化」和第 1 页表格下方的「▶ 汉化这个游戏」是
+        #   **同一条路**（后者转发到这里），所以两处都得切。
+        #   漏掉这一处的代价实测过：用户点底部按钮，界面上除了按钮变灰毫无
+        #   动静，反馈「点了汉化不能跳转到能看到进度的页面」。
+        self._goto_progress()
 
         out_dir = self.game_dir / "_汉化输出"
         self.cancel_event.clear()

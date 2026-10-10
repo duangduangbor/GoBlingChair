@@ -196,9 +196,43 @@ def main() -> int:
               "按钮文案不能写「进度见下方」—— 点完会切到第 2 页，不在下方")
         # 正向：忙的时候按钮必须把用户指到第 2 页去
         _rb = gui_src[gui_src.index("def _lib_refresh_buttons"):]
-        _rb = _rb[:_rb.find("\n    def ", 1)]
+        _rb = _rb[: _rb.find("\n    def ", 1)]
         check("ADV_TAB_NAME" in _rb,
               "忙的时候按钮文案没指向第 2 页（应该拼 ADV_TAB_NAME）")
+        # ★ 底部那条「▶ 开始汉化」（start()）也是同一个入口，也必须切页。
+        #   漏它的代价实测过：用户在游戏库点了底部按钮，界面毫无动静。
+        _st = gui_src[gui_src.index("def start(self)"):]
+        _st = _st[: _st.find("\n    def ", 1)]
+        check("_goto_progress()" in _st,
+              "start() 里没调 _goto_progress() —— 点底部的「▶ 开始汉化」"
+              "看不到进度页（这是用户实际点的那颗，表格里的按钮曾被挤没了）")
+
+        # ---- 9c) v2.6.5 修：游戏库页「从下往上 pack」，按钮不能被挤没 ----
+        # 事故：窗口 1080×756（用户截图那个尺寸）时 mid 卡片需要 591px 只拿到
+        # 302px，「▶ 汉化这个游戏 / ↩ 还原原版 / 📂 打开文件夹」整排 h=1、
+        # mapped=0 —— 屏幕上一个像素都没有，用户根本点不到。默认 1180×840 也一样。
+        # 根因：这几块按「从上往下」的顺序 pack，容器不够高时 pack 把**最后
+        # pack 的那个**挤成 0 高。修法：底部几块改 side="bottom" 从下往上 pack，
+        # 表格（expand=True）让位。
+        check('act.pack(side="bottom"' in gui_src,
+              '游戏库底部按钮排要 side="bottom"'
+              "（否则窗口一矮就先把它挤成 0 高）")
+        for _w in ("self.lib_status", "self.lib_progress", "self.lib_stage",
+                   "self.lib_detail"):
+            check(f'{_w}.pack(side="bottom"' in gui_src,
+                  f"{_w} 也要 side=\"bottom\"（同上，且顺序在按钮之上）")
+        check('tree_wrap.pack(side="top", fill="both", expand=True' in gui_src,
+              "表格要最后 pack 且 expand=True —— 高度不够时由它来让步")
+
+        # ---- 9d) v2.6.5：撤掉「自动找到的游戏位置」那排快捷按钮 ----
+        check("lib_quick_row" not in gui_src,
+              "那排「📁 D:\\SteamLibrary…」快捷按钮应已撤掉（用户要求去掉；"
+              "真正有用的信号是下面那张表）")
+        check("lib_hint" not in gui_src,
+              "快捷按钮下面那行提示要一并撤掉 —— 否则是一句指不到东西的空话")
+        check("_lib_quick_roots" in gui_src and "_lib_boot_next" in gui_src,
+              "撤的只是界面上那排按钮：开机自动探测 + 逐个位置试扫必须留着，"
+              "否则打开软件是一张空表")
 
         # ---- 10) library 不许反向依赖 gui（会成环） ----
         lib_src = (ROOT / "gametl" / "core" / "library.py").read_text(
