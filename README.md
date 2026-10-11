@@ -19,11 +19,76 @@
 | RPG Maker MV / MZ | ✅ 完整 | 明文 JSON 直接读写，含插件 JS 界面文本 |
 | KiriKiri / 吉里吉里 | ✅ 完整 | `.xp3` 解包/回填/重打包（配合 GARbro），自动处理 UTF-16 编码与字体问题 |
 | Ren'Py | ✅ 完整 | `.rpa` 解包，`.rpy` 读写 |
-| Unity | ✅ 完整 | 解析 `*_Data/*.assets` 里的 TextAsset（Yarn Spinner 对话脚本、CSV 文本表），译文写回二进制封包，产出独立汉化版 |
+| Unity | ✅ 完整 | 解析 `*_Data/*.assets` 与 Addressables `.bundle`：TextAsset（Yarn Spinner 对话脚本、CSV 文本表）+ **MonoBehaviour 里的 UI 文本**（I2 Localization、UGUI、TextMeshPro）。译文写回二进制封包并自动刷新 Addressables 的 bundle CRC，产出独立汉化版 |
 | Double Fine 系 | ✅ 完整 | Buddha / Moai 引擎的 `.~h` / `.~p` 封包（Costume Quest 1·2、Stacking、Headlander 等）：自动解包、回填、原位替换优先重打包，无需外部工具 |
 | 通用明文 | ✅ 兜底 | 没有封包的小游戏：散落的 `.txt` / `.csv` / `.json` / `.xml` / `.srt` / `.ass` / `.po`，按格式逐类处理（只碰能读成 UTF-8 的纯文本） |
 
 ## 更新日志
+
+### v2.6.7
+
+- **★★ 找到了 Addressables 校验值「刷不干净」的真凶：catalog 载荷解析器只认了一半记录。**
+  v2.6.6 曾把 `b62cbb0a`（26MB 开场动画包）判成「catalog 里查无此包、校验值无解、只能放弃」。
+  **那个结论是错的** —— 它的 CRC `0xd87a0010`（十进制 3631874064）明明白白写在 catalog 里，
+  只是被解析器漏掉了。真因：`m_ExtraDataString` 解码后**不是纯 UTF-16 文本**，而是
+  `[ASCII 类型全名][UTF-16LE JSON 记录]` 这样**两种编码交替**排布的；ASCII 段的字节数是**奇数**，
+  于是每过一条记录，下一条 JSON 的起始偏移奇偶就翻转一次。旧实现把整块按 UTF-16 解码后再逐条啃，
+  **只有偶数偏移的那一半能解析出来** ——《Irmão do Jorel》212 条只啃出 106 条，`b62cbb0a`
+  正好落在被静默跳过的另一半里。后果是它的 CRC 永远刷不掉，游戏每次启动都
+  `CRC Mismatch. Provided d87a0010 … Will not load AssetBundle` 卡死在 Loading，
+  而排查时「把 `d87a0010` 在游戏目录里翻遍五种编码都搜不到出处」。
+  现在改为在**字节层**定位每条记录的 `{`（UTF-16LE 的 `7b 00`）、从真实字符边界起解析，212 条一条不漏。
+  **修后实测：同一份补丁，`CRC Mismatch` 从 1 条降到 0 条，游戏正常进到语言选择界面。**
+- **★ 补上一类「已经改过、却不在本轮产物里」的包也要刷 CRC。**
+  v2.6.6 起内容没变化的包不再写进补丁目录（补丁更小、要动的文件更少），但**游戏目录里那一份本身
+  可能已经是上一轮改过的** —— 它既不在「本轮改动」里、也不在产物目录里，两处都刷不到，
+  补丁一装立刻 Mismatch。《Irmão do Jorel》的 `a29f6ac8` / `aff1ec57` 就是这么漏的
+  （catalog 记 8029404 / 118150，磁盘上却是 8031992 / 119295）。现在以「文件大小与 catalog
+  记录不符」为准，把这批包一并刷掉。
+- 上面两条合起来，《Irmão do Jorel》从「启动即卡死」变成**正常游玩**，汉化文案也已就位
+  （开场提示「点击任意按钮开始」「轻触以开始」等）。
+
+### v2.6.6
+
+- **修掉一个「汉化完游戏反而打不开」的致命问题：Unity 的 Addressables 分包游戏，改了资源包却不更新校验值。**
+  Addressables 会给每个 `.bundle` 存一个 CRC 并在运行时逐个校验；汉化改写了包体、catalog 里的旧值就失配，
+  运行时**直接拒绝加载**。表现是游戏永远卡在 Loading，`Player.log` 里是一串
+  `CRC Mismatch … Will not load AssetBundle` 带 `RemoteProviderException: Invalid path`（后者是连带报错，
+  路径其实没错）。现在回填后会自动把被改写 bundle 的 CRC 刷新掉。
+  实测《Irmão do Jorel》：同一份补丁，修前卡死（内存停在 474MB），修后正常进游戏（558MB，日志里加载完 52 个序列化文件）。
+- **修掉 Unity 游戏被「翻坏配置」的问题。** 提取器以前会把引擎/插件配置当正文翻：
+  `settings.json` 的 `StandaloneWindows64`、`RuntimeInitializeOnLoads.json` 的 `BlendModes`、
+  `link.xml` 的属性名、EOS 配置的 `ProductName`，以及 Addressables 的 `catalog.json`
+  （19.9MB 被写成 5.35MB，路径占位符 `{Addressables.RuntimePath}` 被翻译 → 运行时 `Invalid path`）。
+  这些值的本质是类型名 / GUID / 路径 / 枚举，翻一个就崩。现在按「文件名名单 + 路径」双重过滤，
+  同时不再提取许可证 / 法律文本（Apache LICENSE 之类，玩家根本看不到）。
+- **Unity 游戏的真文本终于翻得到了：支持 MonoBehaviour 里的 UI 文本。**
+  以前只认 TextAsset，而很多 Unity 游戏（尤其用 Addressables 分包的）文本全在 MonoBehaviour 里 ——
+  同一款《Irmão do Jorel》，只看 TextAsset 只能提取 523 条、而且翻的是 Apache 许可证；
+  现在提取 4728 条真 UI 文本（I2 Localization 的 `_text` / `drawText` / `hyphenedText` / `preParsedText`，
+  UGUI / TextMeshPro 的 `m_Text` / `m_text`）。
+  ⚠️ 字段白名单收得很紧，只认字段名里带 `text` 等文本语义词的字段。实测放手去认
+  `label` / `title` / `description` 会翻到 InControl 手柄插件的设备描述（`VKB-Sim Gladiator MKII…`）
+  和行为树节点名（`Run in parallel`、`Change Character State`）——那些是机器标识，翻了必崩。
+  宁可少翻：**字段名白名单是拿真实游戏换来的，加词之前先想清楚它的值可能是机器字符串。**
+- 二进制回填改用 `packer="original"` 保存，保住原包体的压缩标志（原版 `dataflags=0x243`，
+  默认保存会掉成 `0x40`，丢掉 `BlockInfoNeedPaddingAtStart`），产物加载行为与原版一致。
+- **★ 只回填「校验值能中和」的资源包，其余一律原样保留。**
+  catalog 只覆盖**一部分** bundle ——《Irmão do Jorel》212 个 `.bundle` 里当时只读出 106 个有 CRC 记录。
+  对不上的包按名字比对后跳过，并在日志里说明「哪些包没汉化、少翻了多少条」。
+  没有 catalog 的游戏（不走 Addressables）完全不受影响。
+  ⚠️ **这一段当时还带了个错结论**：说 `b62cbb0a`（26MB）「catalog 里查无此包、校验值无解、
+  改了必崩且无能为力」。**其实是解析器只啃出了一半记录**（详见 v2.6.7）—— 它的 CRC 一直都在
+  catalog 里，所谓「放弃 16 条译文」是白放弃的。
+- **补丁里只放「真的会改变」的文件。** 断点续传重跑时，某个包可能算出来「内容和现在一样」，
+  以前照样写进补丁目录、还得为它去刷 CRC；现在直接不产出，补丁更小、要动的文件更少。
+  同时会把产物目录里**上一轮遗留**的、现在判定为不可汉化的资源包清掉（它们一旦被补丁盖进游戏
+  同样会让游戏进不去）。
+- **★ 原版备份改成按文件惰性补齐。** 以前备份目录「只建一次、之后永不覆盖」——
+  好处是里面那份一定是真原版，坏处是**第二次安装碰到上次没碰过的文件时不会给它留备份**，
+  那些文件被覆盖后就再也还原不回去了（本次实测事故：5 个 `.bundle` 被覆盖且没进备份）。
+  现在每次安装前都会检查「本轮要覆盖的文件、备份里有没有」，缺的立刻补上；
+  已存在的绝不覆盖（先存下的那份才是真原版）。
 
 ### v2.6.5
 

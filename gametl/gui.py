@@ -124,7 +124,7 @@ SASH_RETRY_MAX = 30
 
 APP_NAME = "滚刀哥布林汉化椅"
 APP_NAME_EN = "GoBlingChair"
-APP_VERSION = "2.6.5"
+APP_VERSION = "2.6.7"
 INSTALLER_NAME = "汉化安装器.exe"
 
 #: 第 2 个页签的标题。**单一来源** —— 界面上凡是让用户「去那一页看看」的

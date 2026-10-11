@@ -39,6 +39,58 @@ from .yarn import (
 TEXT_SUFFIXES = {".txt", ".json", ".csv", ".tsv", ".xml", ".yaml", ".yml"}
 
 # ---------------------------------------------------------------------------
+# Unity 引擎 / 插件的「机器配置」文件 —— 里面的字符串是类型名、GUID、资源
+# 路径、枚举值，**一个都不能翻**。
+#
+# 实测事故（IDJ，Addressables + EOS，2026-10-12）：汉化补丁覆盖后游戏启动
+# 直接 Segmentation fault。逐项比对补丁与原版后定位到：
+#   · settings.json 的 m_buildTarget "StandaloneWindows64" → "独立版 Windows 64 位"
+#   · RuntimeInitializeOnLoads.json 的 nameSpace "BlendModes" → "混合模式"
+#   · link.xml 的 <type fullname="CurrentSelectedItem" preserve="all"/>
+#     —— fullname 与 preserve 双双被翻成中文
+#   · eos_product_config.json 的 ProductName → 中文
+#   · catalog.json 的 m_InternalIds 里
+#     {UnityEngine.AddressableAssets.Addressables.RuntimePath} 占位符 → 中文
+# 这些是「配置」不是「文本」。翻错任何一处轻则功能失效，重则启动即崩。
+# ---------------------------------------------------------------------------
+UNITY_MACHINE_FILES = {
+    # Addressables 目录与设置
+    "catalog.json", "settings.json",
+    # Unity 运行时清单
+    "runtimeinitializeonloads.json", "scriptingassemblies.json",
+    "link.xml", "unityservicesprojectconfiguration.json",
+    "google-services-desktop.json",
+    # Epic Online Services
+    "eos_android_config.json", "eos_ios_config.json", "eos_linux_config.json",
+    "eos_macos_config.json", "eos_product_config.json", "eos_steam_config.json",
+    "eos_windows_config.json", "epiconlineservicesconfig.json",
+}
+
+# 这些目录整棵子树都是机器配置（Addressables / EOS）
+UNITY_MACHINE_PATH_PARTS = (
+    "/streamingassets/aa/",
+    "/streamingassets/eos/",
+    "/addressableslink/",
+)
+
+# 许可证/法律文本：翻了没有任何玩家看得到，纯白烧算力
+LICENSE_ASSET_NAMES = ("license", "licence", "notice", "copying", "third party",
+                       "thirdparty", "credits", "changelog")
+
+
+def _is_unity_machine_file(rel: str, name: str) -> bool:
+    """这个文本文件是不是 Unity 机器配置（不该被翻译）。"""
+    if name.lower() in UNITY_MACHINE_FILES:
+        return True
+    r = "/" + rel.lower().replace("\\", "/")
+    return any(part in r for part in UNITY_MACHINE_PATH_PARTS)
+
+
+def _is_license_asset(name: str) -> bool:
+    n = name.lower()
+    return any(k in n for k in LICENSE_ASSET_NAMES)
+
+# ---------------------------------------------------------------------------
 # Yarn：语法判定已迁移到 ``gametl/extractors/yarn.py``
 #
 # 早期这里是「扁平正则扫描」：逐行套几条正则猜哪些行是台词。每遇到一种
@@ -93,6 +145,122 @@ def _is_translatable(text: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# MonoBehaviour 里的 UI 文本
+#
+# Unity 游戏的真文本常常不在 TextAsset 里，而在 MonoBehaviour 的字段里
+# （I2 Localization 的 _text/drawText/hyphenedText/preParsedText，UGUI 的
+# m_Text，TextMeshPro 的 m_text…）。但 MonoBehaviour 的 typetree 里同时混着
+# 大量**机器字符串**：状态名、资源名、GUID、枚举、图层名 —— 翻坏一个状态名
+# 就是游戏跑不起来。所以这里只认「字段名里带文本语义词」的字段，宁可少翻。
+#
+# 字段名先按驼峰/下划线切成词再比对，避免 "context" 里的 "text" 误命中
+# （`_contextParam` 就是靠这条挡掉的）。
+#
+# ⚠️ 这份白名单收得很紧，是拿 IDJ 实测换来的。曾经加过
+# label / title / description，结果：
+#   · InControl 手柄插件的设备描述（'VKB-Sim Gladiator MKII…'、'PS3 Mode'）
+#     —— 翻了会破坏手柄识别；
+#   · 行为树/节点图的节点名（'Run in parallel'、'Change Character State'）
+#     与字段名（'CustomStateName'、'SetActive1'）—— 翻了运行时按名字匹配就断。
+# 这些字段名字都很「像 UI 文本」，但内容是机器标识。宁可少翻。
+MB_TEXT_WORDS = frozenset((
+    "text", "subtitle", "caption", "tooltip", "dialogue",
+))
+# 值是路径 / 术语 key / GUID / 占位符的一律跳过
+_MB_HEX_RE = re.compile(r"^[0-9a-fA-F\-_]{8,}$")
+_MB_WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+
+def _field_words(name: str) -> list[str]:
+    """``drawText`` -> ['draw','text']；``_contextParam`` -> ['context','param']。"""
+    return [w.lower() for w in _MB_WORD_RE.findall(str(name))]
+
+
+def _mb_field_is_text(name: str) -> bool:
+    """字段名看起来是不是「给人看的文本」。"""
+    return any(w in MB_TEXT_WORDS for w in _field_words(name))
+
+
+def _mb_text_ok(value: str) -> bool:
+    """字段值是否值得翻译（保守判定：拿不准就不翻）。"""
+    v = value.strip()
+    if not v or len(v) > 400:
+        return False
+    # 至少 2 个字母 —— 挡掉 "R$ 14,99"、"01"、"--" 这类不该动的值
+    if sum(1 for c in v if c.isalpha()) < 2:
+        return False
+    if _MB_HEX_RE.match(v):
+        return False
+    if "://" in v:
+        return False
+    # 路径 / 术语 key（I2 的 CORE_PROFILES/PROFILE_1）/ 资源名
+    if "/" in v or "\\" in v:
+        return False
+    # 纯占位符，如 {0}、{PlayerName}
+    if v.startswith("{") and v.endswith("}"):
+        return False
+    return True
+
+
+def _walk_mb_strings(node, path: tuple = ()):
+    """递归遍历 typetree，产出 ``(字段路径, 字符串值)``。"""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield from _walk_mb_strings(v, path + (str(k),))
+    elif isinstance(node, (list, tuple)):
+        for i, v in enumerate(node):
+            yield from _walk_mb_strings(v, path + (str(i),))
+    elif isinstance(node, str):
+        yield path, node
+
+
+def _tree_step(node, key: str):
+    """按一个路径片段往下走一层（dict 用键，list 用下标）。"""
+    if isinstance(node, dict):
+        return node.get(key)
+    if isinstance(node, list):
+        try:
+            return node[int(key)]
+        except (ValueError, IndexError):
+            return None
+    return None
+
+
+def _set_mb_field(root, field_path, original: str, value: str) -> bool:
+    """按字段路径把 typetree 里的字符串换成译文。
+
+    只在**当前值仍等于原文**时才替换 —— 提取和回填是两次独立的解析，
+    万一结构对不上，这里宁可放过也不能改错字段。
+    """
+    if not field_path:
+        return False
+    parent = root
+    for key in field_path[:-1]:
+        parent = _tree_step(parent, key)
+        if parent is None:
+            return False
+    last = field_path[-1]
+    if isinstance(parent, dict):
+        if last not in parent:
+            return False
+        cur = parent[last]
+        if isinstance(cur, str) and cur.strip() == original.strip():
+            parent[last] = value
+            return True
+        return False
+    if isinstance(parent, list):
+        try:
+            idx = int(last)
+            cur = parent[idx]
+        except (ValueError, IndexError):
+            return False
+        if isinstance(cur, str) and cur.strip() == original.strip():
+            parent[idx] = value
+            return True
+    return False
+
+
 def _split_choice_line(line: str) -> tuple[str, str, str] | None:
     """把一条 Yarn 选项行拆成 ``(前缀, 正文, 尾部)``。
 
@@ -138,6 +306,9 @@ class UnityExtractor(BaseExtractor):
         super().__init__(decoded_dir)
         self.use_unitypy = use_unitypy and _has_unitypy()
         self._text_units: list[TextUnit] = []
+        # Addressables 覆盖到的 bundle 名（懒解析，见 _addressables_hashes）。
+        # None = 还没算过；set() = 算过、确认这个游戏没有 Addressables。
+        self._addr_known = None
 
     def extract(self) -> list[TextUnit]:
         units: list[TextUnit] = []
@@ -165,6 +336,9 @@ class UnityExtractor(BaseExtractor):
                 continue
             rel = str(path.relative_to(self.decoded_dir)).replace("\\", "/")
             if any(part in rel.lower() for part in skip_parts):
+                continue
+            # Unity 引擎/插件配置：值是类型名/GUID/路径/枚举，翻了必崩
+            if _is_unity_machine_file(rel, path.name):
                 continue
             suf = path.suffix.lower()
             try:
@@ -253,10 +427,13 @@ class UnityExtractor(BaseExtractor):
         return units
 
     def _extract_binary(self) -> list[TextUnit]:
-        """用 UnityPy 从 .assets/.bundle 提取 TextAsset 里的可翻译文本。
+        """用 UnityPy 从 .assets/.bundle 提取可翻译文本。
 
-        对每个 TextAsset，根据其内容形态（.yarn 或 *_lines）精确解析，
-        只提取真正该翻的「台词/正文」行，跳过结构标记与元数据。
+        两类来源：
+        · **TextAsset** —— 按内容形态（.yarn / *_lines）精确解析台词正文；
+        · **MonoBehaviour** —— UI 文本（I2 Localization 的 _text 等）。
+          很多 Unity 游戏（含 Addressables 分包的游戏）根本不把文本放进
+          TextAsset，只看 TextAsset 会把整款游戏漏成 0 条。
         """
         units: list[TextUnit] = []
         try:
@@ -276,7 +453,11 @@ class UnityExtractor(BaseExtractor):
             except Exception:
                 continue
             for obj in env.objects:
-                if obj.type.name != "TextAsset":
+                kind = obj.type.name
+                if kind == "MonoBehaviour":
+                    units.extend(self._extract_monobehaviour(rel, obj))
+                    continue
+                if kind != "TextAsset":
                     continue
                 try:
                     data = obj.read()
@@ -290,9 +471,45 @@ class UnityExtractor(BaseExtractor):
                     continue
                 if not text.strip():
                     continue
+                # 许可证/法律文本（Apache LICENSE 等）：玩家看不到，翻了纯烧算力
+                if _is_license_asset(name):
+                    continue
                 # 记录该 TextAsset 的原始字节，供回填时精确替换
                 units.extend(self._extract_textasset(rel, name, text, obj))
         return units
+
+    def _extract_monobehaviour(self, rel: str, obj) -> list[TextUnit]:
+        """从一个 MonoBehaviour 里提取「给人看的」字符串字段。
+
+        只认字段名带文本语义词的字段（见 ``_mb_field_is_text``），
+        并且跳过路径/key/GUID 形态的值 —— MonoBehaviour 里机器字符串太多，
+        误翻一个状态名就会让游戏跑不起来。
+        """
+        try:
+            tt = obj.read_typetree()
+        except Exception:
+            return []
+        if not isinstance(tt, dict):
+            return []
+        name = tt.get("m_Name") or ""
+        try:
+            path_id = int(obj.path_id)
+        except (TypeError, ValueError):
+            return []
+        out: list[TextUnit] = []
+        for field_path, value in _walk_mb_strings(tt):
+            if not field_path:
+                continue
+            if not _mb_field_is_text(field_path[-1]):
+                continue
+            if not _mb_text_ok(value):
+                continue
+            out.append(self._mk(
+                rel,
+                {"asset": name, "form": "unitypy", "path_id": path_id,
+                 "mb_field_path": list(field_path)},
+                value.strip(), TextKind.OTHER))
+        return out
 
     def _extract_textasset(self, rel: str, name: str, text: str,
                            obj) -> list[TextUnit]:
@@ -422,14 +639,17 @@ class UnityExtractor(BaseExtractor):
         return units
 
     def write_back(self, project: Project, out_dir: Path) -> dict:
-        """回填：文本资源文件直接改；TextAsset 用 UnityPy 写回 .assets。
+        """回填：文本资源文件直接改；TextAsset/MonoBehaviour 用 UnityPy 写回。
 
         二进制回填流程（真正产出汉化资源，而非跳过）：
-        1. 按 source_file（.assets 路径）分组，收集已译的 TextAsset 单元；
-        2. 对每个 TextAsset，按行号/CSV 行把译文替换回文本；
-        3. 用 UnityPy 把改后的 TextAsset 重新序列化，写出新的 .assets 文件。
+        1. 按 source_file（.assets/.bundle 路径）分组，收集已译的单元；
+        2. TextAsset 按行号/CSV 行替换、MonoBehaviour 按字段路径替换；
+        3. 用 UnityPy 重新序列化整包，写出新文件；
+        4. **刷新 Addressables catalog 的 bundle CRC** —— 不刷新的话
+           Addressables 会以「CRC Mismatch」拒绝加载，游戏卡在 Loading。
         """
         out_dir = Path(out_dir)
+        known = self._addressables_hashes()
         by_file: dict[str, list[TextUnit]] = {}
         for u in project.units:
             if u.translated:
@@ -441,22 +661,39 @@ class UnityExtractor(BaseExtractor):
         binary_replaced = 0
         binary_files = 0
         changed: list[str] = []
+        per_file_n: dict[str, int] = {}
+        skipped: list[str] = []
         for rel, us in by_file.items():
             src = self.decoded_dir / rel
             if not src.exists():
                 continue
+            # ★ 资源包先过「CRC 能不能中和」这一关。过不了就一个字都不改：
+            #   Addressables 会拿 catalog 里的旧 CRC 校验，改了必然卡 Loading，
+            #   而有些包的期望值根本找不到出处（改不动、也没法中和）。
+            if self._is_pack(rel) and not self._crc_ok(rel, known):
+                skipped.append(rel)
+                continue
             is_binary = any(u.location.get("form") == "unitypy" for u in us)
             if is_binary:
                 r, differs = self._write_binary_assets(src, out_dir / rel, us)
+                if r and not differs:
+                    # 产物和游戏里现有的这份**逐字节一样**：留着它只会让补丁变胖、
+                    # 还得为它去刷 CRC（而刷 CRC 又要进游戏目录动手脚）。
+                    # 干脆不产出 —— 补丁里只放**真的会改变**的文件。
+                    try:
+                        (out_dir / rel).unlink()
+                    except OSError:
+                        pass
+                    per_file_n[rel] = r
+                    unchanged += 1
+                    continue
                 if r:
+                    per_file_n[rel] = r
                     replaced += r
                     binary_replaced += r
                     binary_files += 1
                     written += 1
-                    if differs:
-                        changed.append(rel)
-                    else:
-                        unchanged += 1
+                    changed.append(rel)
                 continue
 
             suf = src.suffix.lower()
@@ -468,26 +705,168 @@ class UnityExtractor(BaseExtractor):
                 n, differs = self._write_plain(src, out_dir / rel, us)
             replaced += n
             if n:
-                written += 1
-                if differs:
-                    changed.append(rel)
-                else:
+                per_file_n[rel] = n
+                if not differs:
+                    try:
+                        (out_dir / rel).unlink()
+                    except OSError:
+                        pass
                     unchanged += 1
+                    continue
+                written += 1
+                changed.append(rel)
 
+        if skipped:
+            n_left = sum(per_file_n.get(r, 0) for r in skipped)
+            print(f"[Unity] {len(skipped)} 个资源包的 Addressables 校验值没法中和，"
+                  f"保持原样、不汉化（{n_left} 条译文未使用）：")
+            for rel in skipped:
+                print(f"        {rel}（{per_file_n.get(rel, 0)} 条）")
+
+        # 兜底：产物目录里可能躺着**上一轮**留下的、现在判定为不可改的包
+        # （断点续传 / 增量重跑时 write_back 的输出目录是复用的）。
+        # 那些包一旦被补丁盖进游戏，同样会让游戏进不去 —— 一并清掉。
+        stale = self._purge_stale_bundles(out_dir, known)
+        for rel in stale:
+            if rel in changed:
+                changed.remove(rel)
+                written -= 1
+                replaced -= per_file_n.get(rel, 0)
+                binary_replaced -= per_file_n.get(rel, 0)
+                binary_files -= 1
+        if stale:
+            print(f"[Unity] 产物目录里清掉 {len(stale)} 个历史遗留的不可汉化资源包：")
+            for rel in stale:
+                print(f"        {rel}")
+
+        crc_files = self._refresh_addressables_crc(changed, out_dir)
+        for rel in crc_files:
+            if rel not in changed:
+                changed.append(rel)
+                written += 1
         return wb_stats(files_written=written, replaced=replaced,
                         unchanged=unchanged, changed=changed,
                         binary_files=binary_files,
-                        binary_replaced=binary_replaced)
+                        binary_replaced=binary_replaced,
+                        addressables_crc=len(crc_files),
+                        skipped_bundles=sorted(set(skipped) | set(stale)))
+
+    # ---- Addressables / 资源包安全闸 ----
+
+    @staticmethod
+    def _is_pack(rel: str) -> bool:
+        return str(rel).lower().endswith((".bundle", ".unity3d"))
+
+    def _addressables_hashes(self) -> set:
+        """本项目 catalog 覆盖到的 bundle 名集合（只算一次，缓存到实例上）。"""
+        if self._addr_known is not None:
+            return self._addr_known
+        known: set = set()
+        try:
+            from ..core import addressables
+            known = addressables.verifiable_hashes(self.decoded_dir)
+        except Exception:
+            known = set()
+        self._addr_known = known
+        return known
+
+    def _crc_ok(self, rel: str, known: set) -> bool:
+        """这个资源包的 CRC 有没有办法中和？没有 catalog 就当作「没有校验」。"""
+        if not known:                  # 不是 Addressables 游戏
+            return True
+        try:
+            from ..core import addressables
+            return addressables.bundle_stem(rel).lower() in known
+        except Exception:
+            return True
+
+    def _purge_stale_bundles(self, out_dir: Path, known: set) -> list[str]:
+        """删掉产物目录里所有「不可汉化」的资源包（含历史遗留）。
+
+        只删产物（out_dir）里的副本，游戏目录里的原文件一个都不碰。
+        """
+        if not known:
+            return []
+        out_dir = Path(out_dir)
+        if not out_dir.is_dir():
+            return []
+        killed: list[str] = []
+        for p in sorted(out_dir.rglob("*")):
+            if not p.is_file() or not self._is_pack(p.name):
+                continue
+            rel = str(p.relative_to(out_dir)).replace("\\", "/")
+            if self._crc_ok(rel, known):
+                continue
+            try:
+                p.unlink()
+            except OSError:
+                continue
+            killed.append(rel)
+        return killed
+
+    def _dirty_bundles(self) -> set:
+        """游戏目录里「已被改过」的资源包（大小与 catalog 记录不符）。
+
+        ★ v2.6.7：这些包**必须**一起刷 CRC，否则补丁一装就 CRC Mismatch。
+        详见 ``addressables.dirty_bundles`` 的说明（IDJ 的 a29f6ac8 / aff1ec57）。
+        """
+        try:
+            from ..core import addressables
+            return addressables.dirty_bundles(self.decoded_dir)
+        except Exception:
+            return set()
+
+    def _refresh_addressables_crc(self, changed: list[str],
+                                  out_dir: Path) -> list[str]:
+        """凡是**会随补丁一起进游戏**的 AssetBundle，都要同步刷新 catalog 的 CRC。
+
+        否则 Addressables 运行时校验不过：
+        ``CRC Mismatch ... Will not load AssetBundle`` → 游戏永远卡在 Loading。
+
+        口径是「**最终游戏目录里会有哪些被改过的包**」，三路并集：
+
+        1. 这一轮真改了的（``changed``）；
+        2. 产物目录里躺着的（断点续传时某个包这轮算出来「没变」—— 相对的是
+           **已被改过**的游戏文件 —— 但它照样会被装进去）；
+        3. ★ 游戏目录里**已经被改过**、却既不在 changed 也不在产物里的
+           （``_dirty_bundles``，判据是大小与 catalog 记录不符）。
+
+        第 3 条是 v2.6.7 补的坑：漏了它，残留包会在新补丁装好后立刻 Mismatch。
+        宁可多刷几个（刷多无害，CRC=0 只是不校验），绝不能漏。
+        """
+        want = {r for r in changed if self._is_pack(r)}
+        out_dir = Path(out_dir)
+        if out_dir.is_dir():
+            for p in out_dir.rglob("*"):
+                if p.is_file() and self._is_pack(p.name):
+                    want.add(str(p.relative_to(out_dir)).replace("\\", "/"))
+        for h in self._dirty_bundles():
+            want.add(h + ".bundle")
+        bundles = sorted(want)
+        if not bundles:
+            return []
+        try:
+            from ..core import addressables
+            return addressables.refresh(self.decoded_dir, bundles,
+                                        out_dir=out_dir)
+        except Exception:
+            return []
 
     def _write_binary_assets(self, src: Path, dst: Path,
                              us: list[TextUnit]) -> tuple[int, bool]:
-        """把译文写回 .assets 里的 TextAsset，重新序列化整包。
+        """把译文写回 .assets/.bundle，重新序列化整包。
 
-        按 TextAsset 名分组 → 重建每个 TextAsset 的文本 → 写回 m_Script
-        → UnityPy 重新保存整个 .assets 文件。
+        两类目标，一次保存：
+        · **TextAsset** —— 按 asset 名分组，重建文本后写回 ``m_Script``；
+        · **MonoBehaviour** —— 按 ``path_id`` 精确定位对象，读 typetree
+          → 改字段 → ``save_typetree`` 写回。
+
+        保存优先用 ``packer="original"``：默认保存会把 bundle 的 dataflags
+        抹掉（原版 0x243 → 0x40），丢掉 ``BlockInfoNeedPaddingAtStart`` 等标志，
+        产物和原版的加载行为不一致。
 
         Returns:
-            (替换条数, 内容是否与原 .assets 不同)。替换条数为 0 时不落盘。
+            (替换条数, 内容是否与原文件不同)。替换条数为 0 时不落盘。
         """
         try:
             import UnityPy
@@ -499,10 +878,37 @@ class UnityExtractor(BaseExtractor):
         except Exception:
             return 0, False
 
-        # 按 (asset 名) 分组，组内再按行/CSV 行定位
+        n = self._apply_textassets(env, us)
+        n += self._apply_monobehaviours(env, us)
+        if not n:
+            return 0, False
+
+        payload = None
+        try:
+            payload = env.file.save(packer="original")
+        except Exception:
+            payload = None
+        if payload is None:
+            try:
+                payload = env.file.save()
+            except Exception:
+                return n, False
+        if isinstance(payload, dict):      # 多文件 AssetBundle 的返回值
+            payload = next(iter(payload.values()), b"")
+        if not isinstance(payload, (bytes, bytearray)):
+            return n, False
+        _wrote, differs = write_back_file(src, dst, bytes(payload))
+        return n, differs
+
+    def _apply_textassets(self, env, us: list[TextUnit]) -> int:
+        """TextAsset 分支：按 asset 名分组，用行号/CSV 行定位替换。"""
         by_asset: dict[str, list[TextUnit]] = {}
         for u in us:
+            if "mb_field_path" in u.location:
+                continue
             by_asset.setdefault(u.location.get("asset", ""), []).append(u)
+        if not by_asset:
+            return 0
 
         n = 0
         for obj in env.objects:
@@ -527,19 +933,50 @@ class UnityExtractor(BaseExtractor):
                 data.m_Script = new_text.encode("utf-8")
                 data.save()
                 n += cnt
+        return n
 
-        if not n:
-            return 0, False
-        try:
-            payload = env.file.save()
-        except Exception:
-            return n, False
-        if isinstance(payload, dict):      # 多文件 AssetBundle 的返回值
-            payload = next(iter(payload.values()), b"")
-        if not isinstance(payload, (bytes, bytearray)):
-            return n, False
-        _wrote, differs = write_back_file(src, dst, bytes(payload))
-        return n, differs
+    def _apply_monobehaviours(self, env, us: list[TextUnit]) -> int:
+        """MonoBehaviour 分支：按 path_id 定位对象，改 typetree 字段后写回。"""
+        by_obj: dict[int, list[TextUnit]] = {}
+        for u in us:
+            pid = u.location.get("path_id")
+            if pid is None:
+                continue
+            try:
+                by_obj.setdefault(int(pid), []).append(u)
+            except (TypeError, ValueError):
+                continue
+        if not by_obj:
+            return 0
+
+        n = 0
+        for obj in env.objects:
+            if obj.type.name != "MonoBehaviour":
+                continue
+            try:
+                group = by_obj.get(int(obj.path_id))
+            except (TypeError, ValueError):
+                continue
+            if not group:
+                continue
+            try:
+                tt = obj.read_typetree()
+            except Exception:
+                continue
+            if not isinstance(tt, dict):
+                continue
+            cnt = 0
+            for u in group:
+                if _set_mb_field(tt, u.location.get("mb_field_path") or [],
+                                 u.original, restore(u.translated, u.protected)):
+                    cnt += 1
+            if cnt:
+                try:
+                    obj.save_typetree(tt)
+                except Exception:
+                    continue
+                n += cnt
+        return n
 
     def _apply_textasset(self, text: str, group: list[TextUnit]) -> tuple[str, int]:
         """把一组译文替换回 TextAsset 的文本，返回 (新文本, 替换条数)。"""

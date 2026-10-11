@@ -83,7 +83,14 @@ def test_locate(tmp: Path) -> None:
     sub.mkdir(parents=True)
     rec(patcher.find_game_dir(sub) == game.resolve(),
         "从游戏内两层子目录也能向上找到游戏根（补丁包丢进游戏目录也能用）")
-    rec(patcher.find_game_dir(tmp / "别处") is None, "无关目录返回 None")
+    # ⚠️ 这条以前是 `find_game_dir(tmp / "别处")`。它隐含假设「tmp 上面那几层
+    # 都不像游戏」，而 find_game_dir 默认向上找 3 层 —— 于是会一路走到系统
+    # %TEMP%，只要那里面正好躺着测试残留（本项目实测：一个 75 字节的
+    # gametl_selfcheck.xp3 + 某个嵌套目录里的 .~h/.~p 对），这条就假失败。
+    # 想让「无关目录」这个断言稳定，就得把向上查找关在自己的沙箱里：
+    # 从这么深的地方往上走 3 层还在 tmp 内部，永远碰不到系统目录。
+    deep = tmp / "别处" / "一层" / "两层"
+    rec(patcher.find_game_dir(deep / "三层") is None, "无关目录返回 None")
 
     # ---- 各引擎的根目录特征 ----
     # 这里曾经漏了 Unity：`looks_like_game` 认 RPG Maker / Ren'Py / KiriKiri /

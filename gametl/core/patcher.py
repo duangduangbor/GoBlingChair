@@ -94,6 +94,73 @@ def _ensure_windowed(game_dir: Path, engine, on_log: LogCb = None) -> bool:
     return True
 
 
+def _extend_backup(game_dir: Path, backup: Path, changed, packs,
+                   on_log: LogCb = None) -> int:
+    """把「马上要被覆盖、但备份里还没有」的文件补进原版备份。
+
+    为什么要补：备份目录原先「只建一次、之后永不覆盖」，好处是里面那份
+    一定是真正的原版；坏处是**第二次安装碰到新文件时不会给它留备份**，
+    于是那些文件被覆盖后无法还原。IDJ 事故就是这么来的（5 个 .bundle）。
+    现在按文件惰性补齐：只补 ``.bak`` 尚不存在的，已存在的绝不碰。
+
+    ⚠️ 补进去的是**当前**游戏目录里的那份。如果这个文件早就被上一轮改过，
+    存下来的就不是原版 —— 但「有总比没有强」，而且日志会说明补了哪些。
+
+    Returns:
+        新补了几个文件。
+    """
+    man_path = backup / MANIFEST_NAME
+    try:
+        man = json.loads(man_path.read_text(encoding="utf-8")) \
+            if man_path.is_file() else {}
+    except (OSError, ValueError):
+        man = {}
+    if not isinstance(man, dict):
+        man = {}
+    entries = list(man.get("files") or [])
+    have = {str(e.get("rel") or "") for e in entries if isinstance(e, dict)}
+
+    jobs: list[tuple[str, str, Optional[Path]]] = []
+    if packs:
+        for p in packs:
+            try:
+                jobs.append((p.relative_to(game_dir).as_posix(), "pack", p))
+            except ValueError:
+                continue
+    else:
+        for rel in (changed or []):
+            jobs.append((str(rel).replace("\\", "/"), "file", None))
+
+    added = 0
+    for rel, kind, pinned in jobs:
+        if not rel or rel in have:
+            continue
+        src = pinned if pinned is not None else (game_dir / rel)
+        if not src.is_file():
+            continue
+        dst = backup / (rel + BAK_SUFFIX)
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        except OSError as e:
+            _log(on_log, f"  [警告] 补备份失败：{rel}（{e}）—— 这个文件还原不了")
+            continue
+        entries.append({"rel": rel, "kind": kind})
+        have.add(rel)
+        added += 1
+
+    if added:
+        man["files"] = entries
+        try:
+            man_path.write_text(json.dumps(man, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+        except OSError as e:
+            _log(on_log, f"  [警告] 更新备份清单失败：{e}")
+        _log(on_log, f"补备份 {added} 个文件 → {BACKUP_DIRNAME}/"
+                     "（这些以后也能一起还原）")
+    return added
+
+
 def _restore_windowed(game_dir: Path, on_log: LogCb = None) -> None:
     """还原汉化时，把 ``_ensure_windowed`` 改过的 User.cfg 换回来。"""
     cfg = game_dir / "Data" / "Config" / "User.cfg"
@@ -601,6 +668,15 @@ def apply_patch(game_dir: Path, package: Path, *,
                 raise RuntimeError(f"无法写入备份（游戏目录只读？）：{e}") from e
             made_backup = True
             _log(on_log, f"已备份原版 {len(files)} 个文件 → {BACKUP_DIRNAME}/")
+
+        # ---- 补备份：本轮要覆盖、但备份里还没有的文件，立刻补上 ----
+        # 「备份只建一次」有个洞：第二次安装如果碰到上一次没碰过的文件，
+        # 那些文件会被**无备份**地覆盖掉 → 事后想还原也还原不回去。
+        # （IDJ 实测事故 2026-10-12：5 个 .bundle 被覆盖且没进备份。）
+        # 改成按文件惰性补齐：只补 .bak 还不存在的，已存下的永不覆盖
+        # —— 先存下的那份才是真正的原版。
+        _extend_backup(game_dir, backup, changed,
+                       packs if need_repack else None, on_log)
 
         # ---- 覆盖 ----
         _step(on_progress, 4, 4, "写入游戏目录…")

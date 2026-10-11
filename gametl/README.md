@@ -157,11 +157,45 @@ Unity 把资源打包在 `*_Data/*.assets`（SerializedFile）里，游戏对话
 是其中的 **TextAsset**。本工具用 [UnityPy](https://github.com/K0lb3/UnityPy)
 解包并**把译文写回**，产出真正汉化过的 `.assets`（不是只读不改）。
 
+`*_Data/*.assets` 之外，很多游戏（尤其用 **Addressables** 分包的）把文本放在
+`StreamingAssets/aa/**/*.bundle` 里的 **MonoBehaviour** 字段里
+（I2 Localization 的 `_text` / `drawText` / `hyphenedText` / `preParsedText`，
+UGUI / TextMeshPro 的 `m_Text` / `m_text`）—— 这两种本工具都能提取并写回。
+
+> ⚠️ **Addressables 的 .bundle 有 CRC 校验，是本项目最大的一个坑。**
+> catalog（`StreamingAssets/aa/catalog.json`）的 `m_ExtraDataString` 里给每个
+> bundle 存了 `{"m_Hash":…, "m_Crc":…}`。**改写 bundle 字节 → CRC 失配 → 运行时直接
+> 拒绝加载**（`CRC Mismatch … Will not load AssetBundle` + 连带的
+> `RemoteProviderException: Invalid path`，后者是假象、路径没错），
+> 表现是游戏永远卡在 Loading。
+>
+> 因此回填时：①把被改写 bundle 的 `m_Crc` 置 0（Addressables 对 0 跳过校验；
+> 改写必须**等长** —— 载荷按「类型名 + 4 字节长度 + JSON」排布，条目长度一变
+> 后面偏移全错，所以 `0` 后面用空格补足原字符数）；
+> ②**口径要取全**：不止「这一轮改的」，还要并上「产物目录里躺着的」和
+> 「游戏目录里**已经被改过**、大小与 catalog 记录不符的」（历史残留包）。
+> 漏掉任何一类，补丁一装那批包立刻 Mismatch —— IDJ 的 `a29f6ac8`/`aff1ec57`
+> 就是这么漏的。
+>
+> ★★ **解析 `m_ExtraDataString` 必须按字节走，不能整块 UTF-16 解码后再 raw_decode。**
+> 实测它是**两种编码交替**的：
+> `[ASCII 类型全名][UTF-16LE JSON 记录] [ASCII 类型全名][UTF-16LE JSON] …`，
+> ASCII 段字节数是**奇数**，于是每过一条记录，下一条 JSON 的起始偏移奇偶就翻转；
+> 整块解码时**只有一半记录读得出来**（IDJ 212 条只啃出 106 条）。被静默跳过的
+> 那一半里恰好有 `b62cbb0a`（26MB 开场动画包，游戏启动必需），它的 CRC 因此永远
+> 刷不掉，游戏启动即 `CRC Mismatch. Provided d87a0010 … Will not load AssetBundle`
+> 卡死 —— 而排查时「把 `d87a0010` 在游戏目录里翻遍五种编码都搜不到出处」，
+> 一度被误判成「这种包无解、只能放弃」。**其实它一直都在，只是一半记录没被读到。**
+> 正确做法见 `core/addressables.py::_iter_records`：在**字节层**找 `{`
+> （UTF-16LE 的 `7b 00`），从真实字符边界起解码再 raw_decode，212 条一条不漏。
+> （顺带：JSON 字符串里本身带 `{}`，`{UnityEngine.AddressableAssets.Addressables.RuntimePath}`，
+> 自己配对大括号还会把相邻记录粘成一条、`m_BundleSize` 全错位。）
+
 ```bash
 python -m gametl extract "E:/游戏/某Unity游戏" -o p.json
 python -m gametl translate p.json
 python -m gametl writeback p.json -o translated/
-# translated/ 里是改好的 *_Data/*.assets，覆盖回去即可
+# translated/ 里是改好的 *_Data/*.assets（和 .bundle + 刷新过的 catalog.json）
 ```
 
 覆盖的两种主流文本形态（自动识别，无需配置）：
@@ -331,7 +365,7 @@ gametl/
 | **编码错误** | 回填后游戏乱码/崩溃 | 工具已自动保持原编码。若手工改，务必确认是 UTF-16 还是 Shift-JIS |
 | **变量被翻译** | `[pcname]` 变成 `[玩家名]`，游戏报错 | 工具已保护；若模型仍出错，检查 `protect.py` 的模式覆盖 |
 | **加密封包** | 解包工具报「unknown key」 | 需找对应密钥；这是逆向工作，超出本工具范围 |
-| **DRM/校验** | 改文件后游戏拒绝启动 | 走运行时翻译路线（XUnity），不改文件 |
+| **DRM/校验** | 改文件后游戏拒绝启动 | 先看 `Player.log` 有没有 `CRC Mismatch` —— 那是 Addressables 包校验（本工具 v2.6.6 起会自动刷新，**v2.6.7 起不再漏包**）；真是 DRM 才走运行时路线（XUnity），不改文件 |
 
 ---
 
