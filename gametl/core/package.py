@@ -642,3 +642,84 @@ def rank_packages(pkgs: list[dict], game_dir) -> list[dict]:
     # 稳定排序：同分的保持 list_packages 给的「新的在前」顺序
     out.sort(key=lambda r: _VERDICT_RANK.get(r["verdict"], 0), reverse=True)
     return out
+
+
+# ------------------------------------------------- 本机译文（当前游戏自己）
+
+#: 「本机译文」这条候选的身份键。
+#:
+#: 仓库里的包靠**文件路径**认身份，本机译文根本没有文件（它就在
+#: ``data/work/<游戏名>/project.json`` 里），所以给它一个固定哨兵值 ——
+#: 列表刷新后要按身份把用户刚才选的那条重新选回来，不能按下标，
+#: 因为本机译文是插在队首的，下标会整体平移。
+LOCAL_KEY = ":local:"
+
+
+def local_candidate(game_name: str, *, units: int, units_total: int = 0,
+                    target_lang: str = "", finished_at: str = "",
+                    proj_path: str = "") -> dict:
+    """把「当前游戏自己翻好的译文」包装成一条**虚拟翻译包**记录。
+
+    为什么要有它（v2.6.8，用户实测反馈）
+    ------------------------------------
+    翻完一款游戏后，用户回到「一键汉化」卡片，想「点一下就装进游戏」。
+    可这张卡只认 ``packages/`` 里的 ``.gtpkg`` —— **自己刚翻好的译文不在
+    里面**。于是列表里只剩上一款游戏留下来的包，还标着「✖ 对不上」，
+    于是没有任何一条会被自动选中、按钮是灰的，什么都点不了。
+
+    把本机译文当成候选，这条路就通了：它天然属于当前游戏（结论直接记
+    ``match``），默认选中，点一下就装。
+
+    Returns:
+        字段与 :func:`list_packages` 的每一项对齐（多出 ``local`` /
+        ``proj``），这样 :func:`rank_packages` 的结果可以和它直接拼在一
+        起，界面不必分两套渲染。
+    """
+    name = str(game_name or "").strip() or "当前游戏"
+    return {
+        "path": "", "name": f"{name}（本机译文）",
+        "game": f"{name}（本机译文）", "engine": "",
+        "units": int(units or 0), "units_total": int(units_total or 0),
+        "created_at": str(finished_at or ""), "size": 0,
+        "target_lang": str(target_lang or ""), "fingerprint": {},
+        "error": "", "local": True, "proj": str(proj_path or ""),
+    }
+
+
+def cand_key(rec: dict) -> str:
+    """一条候选的身份键：本机译文按类型，仓库包按文件路径。
+
+    ``path`` 做键而不是 ``name`` —— 同名不同内容的包是允许共存的
+    （``add_to_repo`` 会加 ``-2`` 后缀，但用户自己往目录里丢就不一定了）。
+    """
+    if rec.get("local"):
+        return LOCAL_KEY
+    return str(rec.get("path") or "")
+
+
+def merge_candidates(ranked: list, local: dict | None = None) -> list:
+    """把「本机译文」插到仓库包列表的**最前面**。
+
+    它跟当前游戏是同一款作品的译文，谈不上「像不像」，所以直接给
+    ``match``，排第一 —— 用户什么都不用挑，点按钮就行。
+    ``local`` 为 None 时原样返回 ``ranked`` 的浅拷贝。
+    """
+    out: list = []
+    if local is not None:
+        out.append(dict(local, verdict="match",
+                        verdict_text="当前游戏自己的译文，直接就能装"))
+    out.extend(ranked)
+    return out
+
+
+def default_pick(ranked: list) -> Optional[int]:
+    """列表默认该选中哪一条（``None`` = 一条都别选）。
+
+    只挑 ``match`` / ``partial``：``unknown`` 说不准、``mismatch`` 明显
+    不是这个游戏的，都不该替用户选中 —— 那是「✖ 对不上」那条老包会被
+    误装进新游戏的原因。
+    """
+    for i, r in enumerate(ranked):
+        if not r.get("error") and r.get("verdict") in ("match", "partial"):
+            return i
+    return None

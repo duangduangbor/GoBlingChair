@@ -124,7 +124,7 @@ SASH_RETRY_MAX = 30
 
 APP_NAME = "滚刀哥布林汉化椅"
 APP_NAME_EN = "GoBlingChair"
-APP_VERSION = "2.6.7"
+APP_VERSION = "2.6.8"
 INSTALLER_NAME = "汉化安装器.exe"
 
 #: 第 2 个页签的标题。**单一来源** —— 界面上凡是让用户「去那一页看看」的
@@ -335,6 +335,8 @@ class App:
         # 两者并发时各自独立互不干扰。
         self.pkg_thread: threading.Thread | None = None
         self._repo_pkgs: list = []
+        #: 当前游戏装过汉化没有（刷新包列表时顺手读一次，文案要用）
+        self._repo_installed: bool = False
 
         # 游戏库（v2.6.0）：傻瓜式主界面的状态。扫描、读状态都在独立线程，
         # 绝不占主线程（用户可能一指就指到 4TB 机械盘）。
@@ -880,19 +882,22 @@ class App:
         self.pkg_hint.pack(fill="x", pady=(6, 0))
         wrap_to_parent(self.pkg_hint, inner4)
 
-        # ---- 卡片 7：一键汉化（用现成翻译包，免模型） ----
+        # ---- 卡片 7：一键汉化（用现成译文，免模型） ----
         # 跟上面的「开始汉化」是**并列的两条路**：
         #   开始汉化 = 用自己的模型把游戏翻出来（要模型、要等）
-        #   一键汉化 = 拿现成的 .gtpkg 直接写进游戏（零模型、几秒）
+        #   一键汉化 = 拿现成的译文直接写进游戏（零模型、几秒）
+        # 「现成译文」有两个来路，卡片里是同一个列表：
+        #   ① 当前游戏自己翻好的译文（data/work/<游戏名>/project.json）
+        #      —— v2.6.8 加的。翻完就能一键装，不用先导出再收回来。
+        #   ② packages/ 里的 .gtpkg（别人给的 / 以前导出的）
         # 底层就是安装器在用的 patcher.apply_patch —— 就地覆盖 + 原版备份 + 可还原。
-        # 出口是「导出汉化补丁包」，入口是这里，一来一回就闭环了。
         card45 = tk.Frame(col, bg=CARD, highlightbackground="#e5e7eb",
                           highlightthickness=1)
         card45.pack(fill="x", pady=(0, 8))
         inner45 = tk.Frame(card45, bg=CARD)
         inner45.pack(fill="x", padx=16, pady=12)
 
-        tk.Label(inner45, text="一键汉化（用现成翻译包，免模型）",
+        tk.Label(inner45, text="一键汉化（用现成译文，免模型）",
                  bg=CARD, fg=MUTED,
                  font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
 
@@ -922,8 +927,8 @@ class App:
         # 主按钮叫「▶ 开始汉化」，两颗都写「汉化…」会让人以为是一件事的
         # 两个入口。实际上完全是两条路 ——
         #   ▶ 开始汉化        = 调用本机模型，从头把游戏翻出来（要等）
-        #   ✔ 安装到所选游戏  = 把上面列表里选中的 .gtpkg 直接装进去（几秒）
-        # 卡片标题已经写明「一键汉化（用现成翻译包，免模型）」，按钮说「安装」
+        #   ✔ 安装到所选游戏  = 把上面列表里选中的译文直接装进去（几秒）
+        # 卡片标题已经写明「一键汉化（用现成译文，免模型）」，按钮说「安装」
         # 正好接得上，也不会跟主按钮抢同一个动词。
         self.pkg_apply_btn = tk.Button(
             r45a, text="✔ 安装到所选游戏", command=self.apply_package_to_game,
@@ -957,8 +962,10 @@ class App:
 
         self.repo_tip = tk.Label(
             inner45,
-            text="把导出的 .gtpkg 丢进软件目录的 packages 文件夹（或点「收进软件」），\n"
-                 "以后选中游戏就能直接汉化 —— 不用再跑一遍模型翻译。\n"
+            text="这个游戏自己翻好的译文会直接列在最上面，点「✔ 安装到所选游戏」\n"
+                 "就能装进游戏 —— 不用先导出、再收回来。\n"
+                 "别人给的包：把 .gtpkg 丢进软件目录的 packages 文件夹"
+                 "（或点「➕ 收进软件」）。\n"
                  "安装时会自动备份原版，随时可以还原。",
             bg=CARD, fg=MUTED, justify="left", anchor="w",
             font=("Microsoft YaHei UI", 8))
@@ -3108,14 +3115,17 @@ class App:
         self._log(f"翻译包操作失败：{err}", "err")
         messagebox.showerror(APP_NAME, f"翻译包操作失败：\n{err}")
 
-    # ---------------- 一键汉化（用现成翻译包，免模型） ----------------
+    # ---------------- 一键汉化（用现成译文，免模型） ----------------
     #
     # 和上面那条「开始汉化」是两条并列的路：
     #   开始汉化 → 调模型把游戏翻出来（要引擎、要等）
-    #   一键汉化 → 拿现成的 .gtpkg 直接写进游戏（零模型、几秒）
+    #   一键汉化 → 拿现成的译文直接写进游戏（零模型、几秒）
     # 后者就是安装器（汉化安装器.exe）本来在做的事，只是把入口搬进了主界面。
-    # 包从哪来：软件目录的 packages/（或软件根目录），也就是「导出补丁包」
-    # 的落点 —— 导出 → 收进软件 → 直接汉化，闭环。
+    # 译文有两个来路，同一个列表里呈现：
+    #   ① **当前游戏自己的工程**（data/work/<游戏名>/project.json）—— 翻完就能
+    #      一键装。v2.6.8 补的：此前这张卡只认 packages/，自己刚翻好的译文
+    #      反而装不了，用户只能看到上一款游戏留下的包，还标着「对不上」。
+    #   ② packages/（或软件根目录）里的 .gtpkg —— 导出的 / 别人给的。
 
     def _pkg_busy(self) -> bool:
         t = getattr(self, "pkg_thread", None)
@@ -3142,22 +3152,91 @@ class App:
                 f"　·　{n} 条{(' · ' + lang) if lang else ''}")
 
     def _repo_hint_text(self) -> str:
-        pkgs = self._repo_pkgs
-        if not pkgs:
-            return ("软件里还没有翻译包。想走这条路：先「开始汉化」翻一款游戏，"
-                    "再点\n「📦 导出汉化补丁包」，然后回来点「➕ 收进软件」。")
+        """卡片顶部那句话 —— 必须**说出当前是哪个游戏**。
+
+        实测踩过（v2.6.8）：原来只说「都不太像这个游戏」，可界面上压根没写
+        「这个游戏」是谁，列表里唯一的游戏名又是上一款包里的旧游戏名。用户
+        的结论自然是「它没认出我正在汉化的游戏，还停留在老游戏那儿」——
+        文案没错，是它没把主语说出来。
+        """
+        pkgs = [r for r in self._repo_pkgs if not r.get("local")]
+        local = next((r for r in self._repo_pkgs if r.get("local")), None)
         bad = sum(1 for r in pkgs if r.get("error"))
-        if not self.game_dir:
-            return (f"软件里存着 {len(pkgs)} 个翻译包。选好游戏文件夹后，"
-                    "这里会标出哪个能直接用。")
         good = sum(1 for r in pkgs
                    if not r.get("error") and r.get("verdict") == "match")
+
+        if not self.game_dir:
+            head = "还没选游戏"
+            if pkgs:
+                return (f"{head}。软件里存着 {len(pkgs)} 个翻译包 —— "
+                        "选好游戏文件夹后，这里会标出哪个能直接用。")
+            return (f"{head}，软件里也还没有翻译包。\n"
+                    "先选一个游戏文件夹；想翻一款新游戏就点「▶ 开始汉化」。")
+
+        name = self.game_dir.name
+        bits = [f"当前游戏：《{name}》"]
+        if local is not None:
+            if self._repo_installed:
+                # 已经装过了 —— 不能还怂恿用户「直接装」，那是装不进去的
+                bits.append("已经装着汉化了（要换一套译文，先点「↩ 还原原版」"
+                            "退回原版，再装）。")
+                bits.append(f"这个游戏自己有翻好的译文（{local.get('units')} 条）。")
+            else:
+                bits.append(
+                    f"这个游戏自己有翻好的译文（{local.get('units')} 条）—— "
+                    "选下面的「✔ 安装到所选游戏」就能直接装进去，"
+                    "不用再跑一遍模型翻译。")
+            if pkgs:
+                bits.append(f"（另存着 {len(pkgs)} 个翻译包，"
+                            + (f"其中 {good} 个也跟它对得上）" if good
+                               else "都是别的游戏的，用不上）"))
+            return "".join(bits)
+
+        if self._repo_installed:
+            return (f"当前游戏：《{name}》—— 已经装过汉化了。要换一套译文，"
+                    "先点「↩ 还原原版」把游戏退回原版，再装。")
+
+        if not pkgs:
+            return (f"当前游戏：《{name}》。软件里还没有翻译包，这个游戏"
+                    "也没有翻好的译文。\n"
+                    "点「▶ 开始汉化」用本机模型翻一遍，翻完这里就能一键装进游戏。")
+
         if good:
-            return (f"存着 {len(pkgs)} 个包，其中 {good} 个和这个游戏完全吻合，"
-                    "可以直接汉化。"
+            return (f"当前游戏：《{name}》。存着 {len(pkgs)} 个包，其中 {good} 个"
+                    "和它完全吻合，可以直接汉化。"
                     + (f"（另有 {bad} 个读不出来）" if bad else ""))
-        return (f"存着 {len(pkgs)} 个包，但都不太像这个游戏。"
-                "确认没选错游戏的话，也可以手动点一个试试。")
+
+        names = "、".join(str(r.get("game") or r.get("name") or "?")
+                        for r in pkgs[:3])
+        return (f"当前游戏：《{name}》。存着的 {len(pkgs)} 个包都不像它"
+                f"（{names}…）。\n"
+                "确认没选错游戏的话，也可以手动点一个试试；"
+                "或者点「▶ 开始汉化」把这款游戏翻出来，翻完这里就能一键装。")
+
+    # ---- 「本机译文」：当前游戏自己的译文工程 ----
+
+    def _local_candidate(self):
+        """当前游戏翻好的译文 —— 当成一条候选，参与列表与选择。
+
+        没有工程 / 工程里一条译文都没有 → 返回 None（不占列表位置）。
+        """
+        if not self.game_dir:
+            return None
+        try:
+            st = self._read_project_state(self.game_dir)
+        except Exception:                      # noqa: BLE001
+            return None
+        if not st.get("exists"):
+            return None
+        filled = int(st.get("filled") or 0) + int(st.get("journal") or 0)
+        if filled <= 0:
+            return None
+        from gametl.core.package import local_candidate
+        return local_candidate(self.game_dir.name, units=filled,
+                               units_total=int(st.get("units") or 0),
+                               target_lang=self.target_lang,
+                               finished_at=st.get("finished_at") or "",
+                               proj_path=st.get("path") or "")
 
     def _refresh_repo(self, rescan: bool = True) -> None:
         """重画「一键汉化」卡片。
@@ -3167,26 +3246,40 @@ class App:
         """
         if not hasattr(self, "repo_list"):
             return
-        from gametl.core.package import rank_packages
+        from gametl.core.package import (cand_key, default_pick,
+                                        merge_candidates, rank_packages)
         if rescan or not getattr(self, "_raw_pkgs", None):
             self._raw_pkgs = self._scan_repo()
         try:
-            self._repo_pkgs = rank_packages(self._raw_pkgs, self.game_dir)
+            ranked = rank_packages(self._raw_pkgs, self.game_dir)
         except Exception:  # noqa: BLE001
-            self._repo_pkgs = list(self._raw_pkgs)
+            ranked = list(self._raw_pkgs)
+        try:
+            local = self._local_candidate()
+        except Exception:  # noqa: BLE001
+            local = None
+        self._repo_pkgs = merge_candidates(ranked, local)
 
-        had = self._current_repo_index()
+        # 当前游戏装过汉化没有 —— 文案和按钮都要用，读一次存着
+        installed = False
+        if self.game_dir:
+            try:
+                from gametl.core.patcher import patch_status
+                installed = bool(patch_status(self.game_dir).get("installed"))
+            except Exception:  # noqa: BLE001
+                installed = False
+        self._repo_installed = installed
+
+        # 用户刚才选的是哪条 —— 按**身份**记，不按下标：本机译文插在队首，
+        # 下标会整体平移，按下标恢复会选错一条。
+        had = self._current_repo_key()
         self.repo_list.delete(0, "end")
         for r in self._repo_pkgs:
             self.repo_list.insert("end", self._repo_line(r))
 
-        # 默认选中贴合度最高的那个（排序后就是第一个），免得用户还得自己挑
-        pick = had
-        if pick is None and self._repo_pkgs:
-            best = self._repo_pkgs[0]
-            if not best.get("error") and best.get("verdict") in ("match",
-                                                                 "partial"):
-                pick = 0
+        pick = self._index_of_key(had, cand_key)
+        if pick is None:
+            pick = default_pick(self._repo_pkgs)
         if pick is not None and 0 <= pick < len(self._repo_pkgs):
             self.repo_list.selection_set(pick)
             self.repo_list.see(pick)
@@ -3201,6 +3294,23 @@ class App:
             return None
         return sel[0] if sel else None
 
+    def _current_repo_key(self):
+        """当前选中那条的身份键（没选 = None）。"""
+        from gametl.core.package import cand_key
+        i = self._current_repo_index()
+        if i is None or not (0 <= i < len(self._repo_pkgs)):
+            return None
+        return cand_key(self._repo_pkgs[i])
+
+    def _index_of_key(self, key, keyfn):
+        """按身份键反查下标（``key`` 为空返回 None）。"""
+        if not key:
+            return None
+        for i, r in enumerate(self._repo_pkgs):
+            if keyfn(r) == key:
+                return i
+        return None
+
     def _selected_repo_pkg(self):
         i = self._current_repo_index()
         if i is None or not (0 <= i < len(self._repo_pkgs)):
@@ -3210,13 +3320,7 @@ class App:
     def _refresh_repo_buttons(self) -> None:
         rec = self._selected_repo_pkg()
         can_apply = bool(self.game_dir and rec and not rec.get("error"))
-        installed = False
-        if self.game_dir:
-            try:
-                from gametl.core.patcher import patch_status
-                installed = bool(patch_status(self.game_dir).get("installed"))
-            except Exception:  # noqa: BLE001
-                installed = False
+        installed = bool(getattr(self, "_repo_installed", False))
         busy = self._pkg_busy()
         for btn, ok in ((self.pkg_apply_btn, can_apply and not busy),
                         (self.pkg_revert_btn, installed and not busy)):
@@ -3265,7 +3369,13 @@ class App:
             pass
 
     def apply_package_to_game(self):
-        """把选中的翻译包**直接写进游戏**（免模型、可就地还原）。"""
+        """把选中的翻译包**直接写进游戏**（免模型、可就地还原）。
+
+        列表里可能有两条来路不同的东西，这里分流：
+        * 磁盘上的 ``.gtpkg``   → :meth:`_start_apply_package`
+        * 「本机译文」（当前游戏自己翻好的）→ :meth:`_start_apply_local`
+          它没有文件，得先现场打一个临时包再走同一套安装器。
+        """
         if not self.game_dir:
             messagebox.showwarning(APP_NAME, "请先选择游戏文件夹")
             return
@@ -3273,7 +3383,105 @@ class App:
         if rec is None:
             messagebox.showwarning(APP_NAME, "请先在列表里选一个翻译包。")
             return
+        if rec.get("local"):
+            self._start_apply_local(self.game_dir, rec)
+            return
         self._start_apply_package(self.game_dir, rec)
+
+    def _start_apply_local(self, game_dir, rec):
+        """把「当前游戏自己的译文」装进当前游戏。
+
+        ★ 已经装过汉化的游戏必须先还原再装：``apply_patch`` 是拿**包里的
+        原文**去游戏里找地方填的，而装过汉化的游戏里那些原文已经变成中文
+        了 —— 硬装下去一条都对不上，用户只会收到一句「翻译包和这个游戏
+        对不上」的红字，完全看不出真实原因。这里先拦下来，并直接把手
+        递过去（点「是」就还原）。
+        """
+        game_dir = Path(game_dir)
+        if self._pkg_busy():
+            messagebox.showinfo(APP_NAME, "翻译包任务还在跑，请等它结束。")
+            return
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo(APP_NAME, "当前有任务在跑，请等它结束或先取消。")
+            return
+        proj = Path(str(rec.get("proj") or ""))
+        if not proj.is_file():
+            messagebox.showerror(
+                APP_NAME,
+                "找不到这个游戏的工程文件，没法装。\n\n"
+                "先点「▶ 开始汉化」把它翻一遍，翻完这里就能一键装。")
+            return
+
+        try:
+            from gametl.core.patcher import patch_status
+            st = patch_status(game_dir)
+        except Exception:  # noqa: BLE001
+            st = {}
+        if st.get("installed"):
+            if messagebox.askyesno(
+                    APP_NAME,
+                    f"《{game_dir.name}》现在装着汉化。\n\n"
+                    "要重新装一套译文，得先把它**还原成原版** —— 不然游戏里"
+                    "的文字已经是中文了，新译文没地方可对。\n\n"
+                    "现在就帮你还原吗？还原完再点一次"
+                    "「✔ 安装到所选游戏」就行。"):
+                self.revert_game(confirm=False)
+            return
+
+        if not messagebox.askyesno(
+                APP_NAME,
+                "准备把这个游戏自己的译文装进游戏：\n\n"
+                f"  游戏：{game_dir.name}\n"
+                f"  译文：{rec.get('units')} 条（来自 {proj.parent.name}）\n\n"
+                "会在游戏目录里**就地覆盖**含文字的文件，并自动备份原版，\n"
+                "随时可以点「↩ 还原原版」回到原样。\n"
+                "全程不需要模型、不需要联网。\n\n现在开始吗？"):
+            return
+
+        self._set_pkg_busy(True)
+        self.cancel_event.clear()
+        self.progress.configure(value=0)
+        self._lib_progress_reset()
+        self._lib_task(f"⚡ 正在把《{game_dir.name}》自己的译文装进游戏…", pct=0)
+        self._log("═" * 50, "info")
+        self._log(f"一键汉化（本机译文）：{game_dir.name} ← {proj}", "ok")
+        self.pkg_thread = threading.Thread(
+            target=self._apply_local_worker, args=(game_dir, proj), daemon=True)
+        self.pkg_thread.start()
+
+    def _apply_local_worker(self, game_dir: Path, proj_path: Path):
+        """本机译文 → 临时 .gtpkg → 安装器（复用同一条已测过的链路）。"""
+        try:
+            import tempfile
+
+            from gametl.core import patcher
+            from gametl.core.package import PACKAGE_EXT, export_package
+
+            def log(m: str) -> None:
+                self.root.after(0, self._log, m, "info")
+
+            def prog(c: int, n: int, d: str) -> None:
+                self.root.after(0, self._pkg_progress, c, n, d)
+
+            log(f"读工程：{proj_path}")
+            project = self._load_project(proj_path)
+            filled, total = project.progress()
+            if not filled:
+                raise RuntimeError("这个工程里还没有译文 —— "
+                                   "先点「▶ 开始汉化」翻一遍。")
+            log(f"工程 {filled}/{total} 条已译，先打成临时翻译包…")
+            with tempfile.TemporaryDirectory(prefix="gametl_local_") as td:
+                pkg = Path(td) / f"{safe_work_name(game_dir)}{PACKAGE_EXT}"
+                pres = export_package(project, pkg,
+                                      target_lang=self.target_lang)
+                log(f"临时翻译包：{pres['units']} 条 · "
+                    f"{pres['bytes'] / 1048576:.1f} MB")
+                res = patcher.apply_patch(game_dir, pkg, on_log=log,
+                                          on_progress=prog,
+                                          cancel_event=self.cancel_event)
+            self.root.after(0, self._apply_pkg_done, res)
+        except Exception as e:  # noqa: BLE001
+            self.root.after(0, self._apply_pkg_fail, str(e))
 
     def _start_apply_package(self, game_dir, rec, *, confirm: bool = True):
         """把某个翻译包写进某个游戏。
@@ -3380,8 +3588,12 @@ class App:
         self._lib_refresh_buttons()
         messagebox.showerror(APP_NAME, f"一键汉化失败：\n{err}")
 
-    def revert_game(self):
-        """把游戏还原成装汉化之前的样子。"""
+    def revert_game(self, confirm: bool = True):
+        """把游戏还原成装汉化之前的样子。
+
+        ``confirm=False``：调用方**已经问过**了（比如「先还原再装」那条路），
+        别让用户对着同一个问题点两次「是」。
+        """
         if not self.game_dir:
             messagebox.showwarning(APP_NAME, "请先选择游戏文件夹")
             return
@@ -3393,7 +3605,7 @@ class App:
             messagebox.showinfo(APP_NAME, "当前有任务在跑，请等它结束或先取消。")
             return
         from gametl.core.patcher import BACKUP_DIRNAME
-        if not messagebox.askyesno(
+        if confirm and not messagebox.askyesno(
                 APP_NAME,
                 "把游戏还原成安装汉化之前的样子？\n\n"
                 f"  游戏：{self.game_dir.name}\n\n"
@@ -3402,6 +3614,8 @@ class App:
             return
         self._set_pkg_busy(True)
         self.progress.configure(value=0)
+        self._lib_progress_reset()
+        self._lib_task(f"↩ 正在还原《{self.game_dir.name}》…", pct=0)
         self._log("═" * 50, "info")
         self._log(f"还原原版：{self.game_dir}", "info")
         self.pkg_thread = threading.Thread(target=self._revert_worker,
