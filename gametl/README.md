@@ -1574,7 +1574,88 @@ GUI 侧（`gui.py`）：
    拦住并问一句「先帮你还原吗」，顺手把 `revert_game(confirm=False)` 递过去
    （已经问过了，别让用户对着同一个问题点两次「是」）。
 
+### v2.6.9：整章对话为什么一句都没翻（两个静默漏网）
+
+用户反馈「装完汉化进游戏，字幕全是英文」，界面上**没有任何报错**。查下来是
+两处独立的漏网，都不报错、都只影响「内容多寡」而不影响「程序是否跑得动」，
+所以自检和冒烟测试一个都拦不住。
+
+**漏网一：Addressables 的分组子目录从来没被扫到。**
+
+Unity 按「分组」把资源分目录放：
+
+```
+IDJ_Data/StreamingAssets/aa/StandaloneWindows64/*.bundle          ← 第 4 层，能扫到
+IDJ_Data/StreamingAssets/aa/StandaloneWindows64/chapter1/*.bundle ← 第 5 层，被剪掉
+```
+
+`core.scan.iter_files()` 上限是 `DEFAULT_MAX_DEPTH = 4`，而它**只对目录剪枝**
+（第 117 行：`if depth + 1 > max_depth: continue`）—— 同层的**文件**照收。
+于是平台目录下的 bundle 能读到、**分组子目录整棵被跳过**，而且不报错。
+
+IDJ 的 chapter1/2/3 是 **201 个包 / 0.93 GB**，里面是全部对话与字幕。
+做法：给资源包的扫描单独定一个具名常量 `PACK_SCAN_MAX_DEPTH = 8`
+（`extractors/unity.py`），只放宽「找 .assets/.bundle」这一处，
+其它 `iter_files` 调用（纯文本扫描、引擎探测）维持原深度不动。
+
+**漏网二：I2 Localization 的语言表认不出来。**
+
+I2 把所有文本存在一张**语言表**里，一个字段一种语言：
+
+```
+mSource.mLanguages = [{'Name':'English (United States)','Code':'en-US'}, …]
+mSource.mTerms[i].Languages[j] = 第 i 条词、第 j 种语言的正文
+```
+
+两个坑：
+
+1. 字段路径最后一段是**语言下标数字**（`…/Languages/0`），而既有白名单
+   `MB_TEXT_WORDS = {text, subtitle, caption, tooltip, dialogue}` 是按
+   **名字**匹配的 —— 一个词都对不上，整张表静默跳过。
+   实测 IDJ 的唯一英文正文 **6,274 条 / 97,924 个语言槽**全在这里，
+   而白名单只认出了 UGUI 的 `_text`（912 条，且多数已是中文）。
+2. **`mLanguages` 里大部分不是语言。** I2 借这个数组存元数据列
+   （`IdString` / `Type` / `Dialogue` / `FALAS` / `OBS` / `ConsumeType` …），
+   它们的 `Code` 是空串。判据因此定成「`Code` 非空才算真实语言」
+   （`_i2_real_locales()`），元数据列一个字都不碰 —— 翻掉顺序/状态名游戏逻辑就断。
+
+译文写在**原文槽**上（`_i2_source_locale()`：优先 `en*`，其次第一个真实语言），
+不改 `mLanguages` 结构、不加新语言：玩家在语言选择界面挑 English，拿到的就是
+`en-US` 槽 → 挑英文即得中文。回填**零新增链路** —— 位置照旧记成
+`mb_field_path`（`…/mTerms/<i>/Languages/<j>`），`_apply_monobehaviours()`
+按 `path_id` + 路径原样写回。
+
+⚠️ **`_find_i2_tables()` 必须判「`mTerms` 是非空列表」，不能只看键名存在。**
+顶层 typetree 同时也挂着一份**空的** `mTerms` / `mLanguages` 占位（实测 IDJ），
+第一版探针「找到第一个就收工」，于是永远拿到空表、一条都提不出来。
+
+**顺带：I2 的演出标签要保护。** `<e=ChangeReaction,Jorel,Conversando,Risadinha>`
+之类的属性值**不带引号**，而 `core/protect.py` 的 `unity_rich` 只认带引号的写法
+（`=["']…["']`）—— 整类漏保护，模型很容易把它们翻掉或改写，对话的换表情/
+停顿/变色指令就都没了。实测 6,274 条正文里 **4,387 条带标签**，`<e=…>` 一种
+出现 10,127 次。做法：把属性值放宽成「带引号 **或** 不带引号的不含 `<>"'` 空白串」。
+
+**实测（IDJ，同一台机、同一份游戏）：**
+
+| | v2.6.8 | v2.6.9 |
+|---|---|---|
+| 提取条数 | 4,336 | **126,716** |
+| 唯一原文（模型真正要翻的量） | 912 | **8,834** |
+| 来源文件数 | 9（chapter 0 个） | 83（chapter **74** 个） |
+| I2 语言表条数 | 0 | **97,830** |
+
+两份工程的唯一原文差集：**新增 7,924 条**（丢 2 条，是旧工程里两条已废弃的
+残留），即以前整段没被翻过的内容。
+
 ### 测试
+
+`test_v269_i2_terms.py`（41 项）：语言表识别（含「顶层空占位不能被当表」）、
+原文槽选择（有英文选英文 / 无英文退第一个真实语言 / 全元数据列返回 `None`）、
+正文值过滤（长度上限 1000、斜杠保留、URL 拒绝）、六种 I2 标签的
+`protect()`→`restore()` 逐字符往返；外带**真机段**：把 chapter1 的包按真实
+路径（第 5 层）摆进临时目录 → 断言**跨子目录的台词被提到** → 回填 3 条 →
+重开产物逐条核对 → `pt-BR` / `es-US` 槽一条都没被碰。
+样本不在时该段明说 SKIP，不影响退出码（`GAMETL_I2_SAMPLE` 可指定）。
 
 `test_v232_pkg_repo.py`（37 项）：目录约定、收包 / 去重 / 重名、扫描字段、
 坏包容错、匹配排序、`game_dir=None` 一律 unknown，外加两条静态检查 ——

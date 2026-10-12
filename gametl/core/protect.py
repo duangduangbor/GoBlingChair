@@ -38,8 +38,17 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("brace", re.compile(r"\{[^{}]{0,120}\}")),
     # 百分号占位 %s %d %1$s %%
     ("percent", re.compile(r"%\d*\$?[sdifxXeEgc%]")),
-    # Unity TextMeshPro 富文本 <color=...> </color> <b> 等
-    ("unity_rich", re.compile(r"</?[a-zA-Z][\w\-]*(?:\s*=\s*[\"'][^\"']*[\"'])?\s*/?>")),
+    # Unity TextMeshPro 富文本 <color=...> </color> <b> 等。
+    #
+    # ⚠️ 属性值**可以不带引号** —— 早期只认带引号的写法，于是 I2 Localization
+    # 的动作标签整类漏保护：`<e=ChangeReaction,Jorel,Conversando,Risadinha>`、
+    # `<c=#00c13c>`、`<w=sassy>`、`<s=0.7>`、`<d=20>`。这些标签是给引擎看的
+    # 演出指令（换表情/停顿/变色），翻掉或改写它们，对话的表现就全乱了。
+    # 实测 IDJ 的 6274 条正文里 4387 条带标签，`<e=…>` 一种就出现 10127 次。
+    ("unity_rich", re.compile(
+        r"</?[a-zA-Z][\w\-]*"
+        r"(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^<>\"'\s]{1,120}))?"
+        r"\s*/?>")),
     # RPG Maker 的 \V[1] \N[1] \C[1] \I[1] 控制码
     ("rpgmaker_ctrl", re.compile(r"\\[VNCIEX]{1,2}\[\d+\]")),
     # 美元符号变量 $gameVariables...

@@ -24,6 +24,7 @@ import io
 import json
 import re
 from pathlib import Path
+from typing import Optional
 
 from ..core.models import Project, TextKind, TextUnit
 from ..core.protect import protect, restore
@@ -37,6 +38,18 @@ from .yarn import (
 )
 
 TEXT_SUFFIXES = {".txt", ".json", ".csv", ".tsv", ".xml", ".yaml", ".yml"}
+
+#: 找 ``.assets`` / ``.bundle`` 时允许的最大目录深度。
+#:
+#: ⚠️ **不能用 ``core.scan`` 的默认值 4。** Addressables 的**分组目录**正好
+#: 卡在第 5 层：``…/StreamingAssets/aa/StandaloneWindows64/chapter1/*.bundle``。
+#: ``iter_files`` 只对**目录**做深度剪枝（同层的文件照收），所以深度 4 时
+#: 平台目录下的 bundle 能读到、**分组子目录整棵被剪掉**。
+#:
+#: 实测代价（IDJ，2026-10-12）：chapter1/2/3 共 201 个包、0.93 GB —— 里面
+#: 是**全部对话与字幕**（I2 LanguageSource 语言表），一条都没提取到。用户看到
+#: 的现象是「菜单翻了、进游戏字幕全是英文」，而且界面上没有任何报错。
+PACK_SCAN_MAX_DEPTH = 8
 
 # ---------------------------------------------------------------------------
 # Unity 引擎 / 插件的「机器配置」文件 —— 里面的字符串是类型名、GUID、资源
@@ -213,6 +226,104 @@ def _walk_mb_strings(node, path: tuple = ()):
             yield from _walk_mb_strings(v, path + (str(i),))
     elif isinstance(node, str):
         yield path, node
+
+
+# ---------------------------------------------------------------------------
+# I2 Localization 的**语言表**
+#
+# 很多 Unity 游戏（含 Addressables 分包的游戏）把所有可见文本统一存在 I2 的
+# LanguageSourceData 里：
+#
+#     mSource.mLanguages = [{'Name':'English (United States)','Code':'en-US'}, …]
+#     mSource.mTerms[i].Languages[j] = 第 i 条词、第 j 种语言的正文
+#
+# ⚠️ 为什么不能靠上面的「文本语义词」白名单蒙对：这条路径的最后一段是
+# **语言下标数字**（``…/Languages/0``），一个词都对不上，于是整张表被静默跳过。
+# 实测（IDJ）：真正的对话与字幕全在这里，而白名单只认出 UGUI 的 ``_text``。
+#
+# ⚠️ 另一条坑：``mLanguages`` 里只有前几个是**真实语言**（有 ``Code``：
+# en-US / pt-BR / es-US），后面几十个是 I2 借这个数组存**元数据列**
+# （``IdString`` / ``Type`` / ``Dialogue`` / ``FALAS`` / ``OBS`` …）。
+# 它们 ``Code`` 为空，**绝不能当正文翻** —— 翻掉顺序状态名，游戏逻辑就断。
+# ---------------------------------------------------------------------------
+
+#: I2 词条正文字段的最大长度。IDJ 实测最长 433 字符（带一串 `<e=` 动作标签）。
+_I2_MAX_LEN = 1000
+
+
+def _i2_real_locales(m_langs) -> list:
+    """``mLanguages`` 里**真实语言**的 ``(下标, 语言码)``；元数据列不在内。"""
+    out = []
+    for i, L in enumerate(m_langs or []):
+        if isinstance(L, dict):
+            code = str(L.get("Code") or "").strip()
+            if code:
+                out.append((i, code))
+    return out
+
+
+def _i2_source_locale(m_langs) -> Optional[int]:
+    """语言表里哪一槽是「原文」—— 优先英文，其次第一个真实语言。
+
+    中文译文写在**原文槽**里：玩家在语言选择界面挑的是哪个语言，看到的就
+    是那个语言槽（IDJ 挑 English → ``en-US`` 槽）。改原文槽 = 挑英文即得中文，
+    不用动 ``mLanguages`` 的结构、也不用给它加新语言。
+    """
+    real = _i2_real_locales(m_langs)
+    for i, code in real:
+        if code.lower().startswith("en"):
+            return i
+    return real[0][0] if real else None
+
+
+def _i2_text_ok(value: str) -> bool:
+    """I2 词条正文值是否值得翻译（判定比 ``_mb_text_ok`` 宽，理由见下）。
+
+    比 ``_mb_text_ok`` 宽的两处：
+    · 长度上限放到 :data:`_I2_MAX_LEN`（对话整段本来就长，卡 400 会整段丢掉）；
+    · **不排斥 ``/``** —— 这里已经是「真实语言槽」了，值就是给人看的正文，
+      出现斜杠是正常标点，而不是 ``_mb_text_ok`` 要防的「资源路径/术语 key」。
+    """
+    v = value.strip()
+    if not v or len(v) > _I2_MAX_LEN:
+        return False
+    if sum(1 for c in v if c.isalpha()) < 1:
+        return False
+    if "://" in v:
+        return False
+    if v.startswith("{") and v.endswith("}"):
+        return False
+    return True
+
+
+def _find_i2_tables(tt):
+    """在 typetree 里找出所有 I2 语言表，返回 ``[(路径, 表字典), …]``。
+
+    表可能挂在顶层，也可能嵌在 ``mSource`` 下 —— 两种都要认。
+
+    ★ 判定必须是「``mTerms`` 是**非空**列表」，不能只看「有这个键」：
+      顶层 typetree 同时也挂着一份**空的** ``mTerms`` / ``mLanguages``
+      占位（实测 IDJ），只看键名会永远拿到空表、一条都提不出来。
+    """
+    found: list = []
+
+    def walk(node, path: tuple):
+        if isinstance(node, dict):
+            terms = node.get("mTerms")
+            is_table = isinstance(terms, list) and bool(terms) and "mLanguages" in node
+            if is_table:
+                found.append((path, node))
+            for k, v in node.items():
+                # 命中表之后就不再往 mTerms 里面钻（几万条词，纯浪费）
+                if is_table and k == "mTerms":
+                    continue
+                walk(v, path + (str(k),))
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                walk(v, path + (str(i),))
+
+    walk(tt, ())
+    return found
 
 
 def _tree_step(node, key: str):
@@ -443,7 +554,10 @@ class UnityExtractor(BaseExtractor):
 
         # 注意：`.assets` 的松散匹配是为了兼容 split 出来的同名前缀文件；
         # 备份产物（*.assets.bak 等）已由 core.scan.iter_files 统一剔除。
-        targets = [p for p in iter_files(self.decoded_dir)
+        # 深度必须放宽到 PACK_SCAN_MAX_DEPTH —— Addressables 的分组子目录
+        # （chapter1/…）里装着整款游戏的对话，默认深度 4 会把它们全剪掉。
+        targets = [p for p in iter_files(self.decoded_dir,
+                                         max_depth=PACK_SCAN_MAX_DEPTH)
                    if p.suffix.lower() in (".assets", ".bundle", ".unity3d")
                    or ".assets" in p.name]
         for path in targets:
@@ -481,9 +595,14 @@ class UnityExtractor(BaseExtractor):
     def _extract_monobehaviour(self, rel: str, obj) -> list[TextUnit]:
         """从一个 MonoBehaviour 里提取「给人看的」字符串字段。
 
-        只认字段名带文本语义词的字段（见 ``_mb_field_is_text``），
-        并且跳过路径/key/GUID 形态的值 —— MonoBehaviour 里机器字符串太多，
-        误翻一个状态名就会让游戏跑不起来。
+        分两条路：
+        1. **I2 Localization 语言表**（``mTerms[i].Languages[j]``）——
+           整款游戏的对话/字幕/菜单常常全在这儿。见 :func:`_find_i2_tables`
+           上方的说明：这条路径的最后一段是语言**下标数字**，靠字段名白名单
+           永远认不出来，必须单独走。
+        2. **常规字段** —— 只认字段名带文本语义词的字段（见
+           ``_mb_field_is_text``），并跳过路径/key/GUID 形态的值：
+           MonoBehaviour 里机器字符串太多，误翻一个状态名游戏就跑不起来。
         """
         try:
             tt = obj.read_typetree()
@@ -497,6 +616,12 @@ class UnityExtractor(BaseExtractor):
         except (TypeError, ValueError):
             return []
         out: list[TextUnit] = []
+        # --- 路 1：I2 语言表 ---
+        # 两条路**都跑**（不 early-return）：同一个对象理论上既有语言表、
+        # 又有 UGUI 文本字段。语言表的值落在 `/mTerms/N/Languages/M` 上，
+        # 最后一段是数字，下面的白名单本来也不会重复命中它们。
+        out.extend(self._extract_i2_terms(rel, path_id, tt))
+        # --- 路 2：常规字段 ---
         for field_path, value in _walk_mb_strings(tt):
             if not field_path:
                 continue
@@ -509,6 +634,36 @@ class UnityExtractor(BaseExtractor):
                 {"asset": name, "form": "unitypy", "path_id": path_id,
                  "mb_field_path": list(field_path)},
                 value.strip(), TextKind.OTHER))
+        return out
+
+    def _extract_i2_terms(self, rel: str, path_id: int, tt: dict) -> list[TextUnit]:
+        """提 I2 Localization 语言表里**原文槽**的正文。
+
+        位置记成 ``mb_field_path``（``…/mTerms/<i>/Languages/<j>``），
+        回填侧 ``_apply_monobehaviours`` 按 ``path_id`` + 这条路径原样写回，
+        **一行新代码都不用加**。
+        """
+        out: list[TextUnit] = []
+        for base_path, table in _find_i2_tables(tt):
+            idx = _i2_source_locale(table.get("mLanguages"))
+            if idx is None:
+                continue
+            for ti, term in enumerate(table.get("mTerms") or []):
+                if not isinstance(term, dict):
+                    continue
+                langs = term.get("Languages")
+                if not isinstance(langs, list) or idx >= len(langs):
+                    continue
+                val = langs[idx]
+                if not isinstance(val, str) or not _i2_text_ok(val):
+                    continue
+                out.append(self._mk(
+                    rel,
+                    {"asset": "", "form": "unitypy", "path_id": path_id,
+                     "mb_field_path": list(base_path) + [
+                         "mTerms", str(ti), "Languages", str(idx)],
+                     "i2_term": True},
+                    val.strip(), TextKind.DIALOGUE))
         return out
 
     def _extract_textasset(self, rel: str, name: str, text: str,
